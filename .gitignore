@@ -1,0 +1,10 @@
+work/
+.build/
+.swiftpm/
+.DS_Store
+.env
+.env.*
+*.app/
+*.dSYM/
+*.xcuserstate
+xcuserdata/
