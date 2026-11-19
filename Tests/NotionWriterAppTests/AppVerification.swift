@@ -21,16 +21,17 @@ enum TestDestination {
     }
 }
 
-private enum CheckFailure: Error { case failed(String) }
-private func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
+enum CheckFailure: Error { case failed(String) }
+func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
     if try !condition() { throw CheckFailure.failed(message) }
 }
-private final class OfflineProtocol: URLProtocol {
+final class OfflineProtocol: URLProtocol {
     static var alternateDestination: NotionDestination?
     static var pageStatus = 400
     static var pageRequests = 0
     static var schemaRequests = 0
     static var rejectUpload = false
+    static var conversationSchema = false
     static var pagePayload: Data?
     static var pageParentOverride: [String: String]?
     static var moveAfterFirstAppend = false
@@ -56,7 +57,12 @@ private final class OfflineProtocol: URLProtocol {
             }
         } else if path.contains("data_sources/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.dataSourceID) ? $0 : nil } ?? TestDestination.target
-            value = TestDestination.source(target, properties: ["名前": ["id": "title", "name": "名前", "type": "title"]])
+            var properties = ["名前": ["id": "title", "name": "名前", "type": "title"]]
+            if Self.conversationSchema {
+                properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
+                properties["別のリンク"] = ["id": "other", "name": "別のリンク", "type": "url"]
+            }
+            value = TestDestination.source(target, properties: properties)
         } else if path.contains("views/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.viewID ?? "") ? $0 : nil } ?? TestDestination.withView
             value = ["id": target.viewID!, "name": "閲覧", "parent": ["database_id": target.databaseID],
@@ -137,6 +143,10 @@ private actor BookmarkLookups {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("NotionWriterVerification-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         do {
+            if CommandLine.arguments.dropFirst().first == "--verify-conversation-samples" {
+                try await verifyConversationSamples(Array(CommandLine.arguments.dropFirst(2)), root: root)
+                return
+            }
             let state = try state(root: root)
             state.draft.title = "日本語\n\n絵文字🎷\n"
             state.draft.body = "## 見出し\n- **太字**"
@@ -640,6 +650,7 @@ private actor BookmarkLookups {
             try await verifyHistoryRetries(root: root)
             try await verifyHistoryLimit(root: root)
             try await verifyBookmarkThumbnails(root: root, png: png)
+            try await verifyConversationImport(root: root)
             print("PASS: app-level verification used isolated temporary data and offline transport")
         } catch { print("FAIL: \(error)"); exit(1) }
     }

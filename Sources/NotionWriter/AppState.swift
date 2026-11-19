@@ -27,6 +27,8 @@ import NotionWriterCore
     private(set) var recentSends: [SendRecord]
     private(set) var sendingID: UUID?
     private(set) var historyFeedback: String?
+    private var aiStudioFiles: [String: Data]
+    var aiStudioFileCount: Int { aiStudioFiles.count }
     private var pendingSave: DispatchWorkItem?
     private var generation = 0
     private let clientOverride: (() throws -> NotionClient)?
@@ -62,6 +64,7 @@ import NotionWriterCore
         let storedConnection = destination?.connection
         store = local
         activeDestination = destination
+        aiStudioFiles = (try? local.read([String: Data].self, name: AIStudioAccess.storeName)) ?? [:]
         schema = try local.read(Schema.self, name: cacheName(storedConnection))
         draft = try local.read(Draft.self, name: local.draftName(for: storedConnection)) ?? Draft()
         recentSends = Array(try SendRecord.load(from: local, destination: destination).prefix(historyLimit))
@@ -443,6 +446,54 @@ import NotionWriterCore
                 : "Webの内容を取り込みました。取得できなかった画像\(content.skippedImages)枚はリンクで残しています。"
         } catch {
             status = "Webの内容を取り込めませんでした。 " + error.localizedDescription
+        }
+    }
+
+    func aiStudioFile(for id: String) -> URL? {
+        guard let bookmark = aiStudioFiles[id] else { return nil }
+        return AIStudioAccess.resolve(bookmark)
+    }
+
+    func disconnectAIStudioFiles() throws {
+        try store.write([String: Data](), name: AIStudioAccess.storeName)
+        aiStudioFiles.removeAll()
+        updated?()
+    }
+
+    func addConversation(_ source: ConversationImport.Source,
+                         loadChat: @escaping @Sendable (ConversationLink) async throws -> Transcript,
+                         insert: (ConversationImport.Prepared) throws -> Void) async -> Bool {
+        guard !busy, !importingImages, !changingDestination, !draft.submissionPending else { return false }
+        importingImages = true
+        status = "内容を取り込み中…"
+        updated?()
+        defer { importingImages = false; updated?() }
+
+        do {
+            let prepared = try await Task.detached(priority: .userInitiated) {
+                try await ConversationImport.prepare(source, loadChat: loadChat)
+            }.value
+            try Task.checkCancellation()
+            try insert(prepared)
+            try flush()
+            status = "本文に取り込みました"
+            if let bookmark = prepared.aiStudioBookmark {
+                var next = aiStudioFiles
+                next[bookmark.id] = bookmark.data
+                do {
+                    try store.write(next, name: AIStudioAccess.storeName)
+                    aiStudioFiles = next
+                } catch {
+                    status = "本文に取り込みました。ファイルへの接続は保存できませんでした。"
+                }
+            }
+            return true
+        } catch is CancellationError {
+            status = "取り込みをキャンセルしました。"
+            return false
+        } catch {
+            status = error.localizedDescription
+            return false
         }
     }
 

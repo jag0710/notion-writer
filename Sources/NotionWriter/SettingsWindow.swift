@@ -29,6 +29,8 @@ import NotionWriterCore
     private let bookmarkModeButton = NSPopUpButton()
     private let historyLimitButton = NSPopUpButton()
     private let historyRows = stack(.vertical, spacing: 14)
+    private let aiStudioDetail = label("", size: 12, color: .secondaryLabelColor)
+    private let disconnectAIStudioButton = NSButton(title: "ファイル接続を解除", target: nil, action: nil)
     private let historyMessage = label("", size: 11, color: .secondaryLabelColor)
     private var renderedHistory: [SendRecord] = []
     private var historyButtons: [(SendRecord, NSButton)] = []
@@ -56,10 +58,11 @@ import NotionWriterCore
             window.contentView!.widthAnchor.constraint(greaterThanOrEqualToConstant: 580),
             window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: 560)
         ])
-        buildConnectionTab(addTab("Notion", to: tabs, scrollable: true))
+        buildConnectionTab(addTab("Notionへの接続", to: tabs, scrollable: true))
         buildDisplayTab(addTab("表示", to: tabs))
         buildGeneralTab(addTab("一般", to: tabs))
         buildHistoryTab(addTab("履歴", to: tabs, scrollable: true))
+        buildConversationTab(addTab("対話取り込み", to: tabs))
         tabs.delegate = self
         window.setContentSize(NSSize(width: 580, height: 560)); window.center(); update()
     }
@@ -98,6 +101,20 @@ import NotionWriterCore
         field.setContentCompressionResistancePriority(.required, for: .vertical)
         root.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
+    private func buildConversationTab(_ root: NSStackView) {
+        root.addArrangedSubview(label("Google AI Studio", size: 16))
+        root.addArrangedSubview(aiStudioDetail)
+        explain("アプリでは、最初に対話URLを入力したときに選んだGoogle Driveの対話ファイルを読み取ります。Googleアカウントのログインはブラウザで行います。", in: root)
+        disconnectAIStudioButton.target = self
+        disconnectAIStudioButton.action = #selector(disconnectAIStudio)
+        root.addArrangedSubview(disconnectAIStudioButton)
+    }
+
+    @objc private func disconnectAIStudio() {
+        do { try state.disconnectAIStudioFiles(); update() }
+        catch { NSAlert(error: error).runModal() }
+    }
+
     private func buildHistoryTab(_ root: NSStackView) {
         for limit in SendRecord.limits {
             historyLimitButton.addItem(withTitle: "\(limit)件まで保存")
@@ -459,6 +476,9 @@ import NotionWriterCore
             $0.representedObject as? String == state.bookmarkMode.rawValue
         }
         if let bookmarkModeIndex { bookmarkModeButton.selectItem(at: bookmarkModeIndex) }
+        let fileCount = state.aiStudioFileCount
+        aiStudioDetail.stringValue = fileCount == 0 ? "接続しているファイルはありません。" : "接続済みの対話ファイル  \(fileCount)件"
+        disconnectAIStudioButton.isEnabled = fileCount > 0 && !state.importingImages
         connectButton.isEnabled = !state.busy && !state.syncing && !state.importingImages && !connecting
         database.isEnabled = connectButton.isEnabled
         token.isEnabled = connectButton.isEnabled
