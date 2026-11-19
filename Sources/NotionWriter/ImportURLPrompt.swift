@@ -1,21 +1,21 @@
 import AppKit
 import NotionWriterCore
 
-@MainActor final class ArticleURLPrompt: NSObject, NSTextFieldDelegate {
+@MainActor final class ImportURLPrompt: NSObject, NSTextFieldDelegate {
     private let alert = NSAlert()
     private let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
     private let importButton: NSButton
 
-    override init() {
+    init(title: String, instruction: String, fieldLabel: String) {
         importButton = alert.addButton(withTitle: "取り込む")
         super.init()
         let cancel = alert.addButton(withTitle: "キャンセル")
         cancel.keyEquivalent = "\u{1B}"
         alert.alertStyle = .informational
-        alert.messageText = "記事を取り込む"
-        alert.informativeText = "公開記事のURLを入力してください。"
+        alert.messageText = title
+        alert.informativeText = instruction
         field.placeholderString = "https://"
-        field.setAccessibilityLabel("記事のURL")
+        field.setAccessibilityLabel(fieldLabel)
         field.delegate = self
         field.isAutomaticTextCompletionEnabled = false
         alert.accessoryView = field

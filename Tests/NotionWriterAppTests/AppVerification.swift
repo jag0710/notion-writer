@@ -21,14 +21,17 @@ enum TestDestination {
     }
 }
 
-private enum CheckFailure: Error { case failed(String) }
-private func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
+enum CheckFailure: Error { case failed(String) }
+func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
     if try !condition() { throw CheckFailure.failed(message) }
 }
-private final class OfflineProtocol: URLProtocol {
+final class OfflineProtocol: URLProtocol {
     static var alternateDestination: NotionDestination?
     static var pageStatus = 400
     static var pageRequests = 0
+    static var schemaRequests = 0
+    static var rejectUpload = false
+    static var conversationSchema = false
     static var pagePayload: Data?
     static var pageParentOverride: [String: String]?
     static var moveAfterFirstAppend = false
@@ -46,6 +49,7 @@ private final class OfflineProtocol: URLProtocol {
         var value: [String: Any] = [:]
         var status = 200
         if path.contains("databases/") {
+            Self.schemaRequests += 1
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.databaseID) ? $0 : nil } ?? TestDestination.target
             value = TestDestination.database(target)
             if Self.databaseChangesAfterUpload && Self.uploadCount > 0 {
@@ -53,11 +57,19 @@ private final class OfflineProtocol: URLProtocol {
             }
         } else if path.contains("data_sources/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.dataSourceID) ? $0 : nil } ?? TestDestination.target
-            value = TestDestination.source(target, properties: ["名前": ["id": "title", "name": "名前", "type": "title"]])
+            var properties = ["名前": ["id": "title", "name": "名前", "type": "title"]]
+            if Self.conversationSchema {
+                properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
+                properties["別のリンク"] = ["id": "other", "name": "別のリンク", "type": "url"]
+            }
+            value = TestDestination.source(target, properties: properties)
         } else if path.contains("views/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.viewID ?? "") ? $0 : nil } ?? TestDestination.withView
             value = ["id": target.viewID!, "name": "閲覧", "parent": ["database_id": target.databaseID],
                      "data_source_id": target.dataSourceID, "configuration": ["properties": [["property_id": "title"]]]]
+        } else if path == "/v1/file_uploads", Self.rejectUpload {
+            status = 403
+            value = ["object": "error", "code": "restricted_resource", "status": 403]
         } else if path == "/v1/file_uploads", Self.uploadCount < Self.uploadIDs.count {
             value = ["id": Self.uploadIDs[Self.uploadCount]]
             Self.uploadCount += 1
@@ -109,19 +121,32 @@ private final class OfflineProtocol: URLProtocol {
     }
 }
 
+private actor BookmarkLookups {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
 @main struct AppVerification {
-    @MainActor static func state(root: URL) throws -> AppState {
+    private static let isolatedPreferences = UserDefaults(suiteName: "NotionWriterVerify." + UUID().uuidString)!
+
+    @MainActor static func state(root: URL, destination: NotionDestination = TestDestination.target,
+                                preferences: UserDefaults = isolatedPreferences,
+                                preview: @escaping @Sendable (URL) async -> BookmarkPreview? = { _ in nil }) throws -> AppState {
         let store = try LocalStore(root: root)
-        try store.write(TestDestination.target, name: "destination")
+        try store.write(destination, name: "destination")
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [OfflineProtocol.self]
         let api = NotionClient(token: "offline-test-only", session: URLSession(configuration: config))
-        return try AppState(qa: false, dataRoot: root, clientOverride: { api })
+        return try AppState(qa: false, dataRoot: root, clientOverride: { api }, preferences: preferences, bookmarkPreview: preview)
     }
     @MainActor static func main() async {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("NotionWriterVerification-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         do {
+            if CommandLine.arguments.dropFirst().first == "--verify-conversation-samples" {
+                try await verifyConversationSamples(Array(CommandLine.arguments.dropFirst(2)), root: root)
+                return
+            }
             let state = try state(root: root)
             state.draft.title = "日本語\n\n絵文字🎷\n"
             state.draft.body = "## 見出し\n- **太字**"
@@ -134,9 +159,13 @@ private final class OfflineProtocol: URLProtocol {
 
             OfflineProtocol.pageStatus = 400; OfflineProtocol.pageRequests = 0
             await state.submit()
-            try require(state.draft == original && !state.busy, "Rejected save changed draft")
+            var rejected = state.draft
+            rejected.submissionID = nil
+            try require(rejected == original && !state.busy, "Rejected save changed draft")
+            try require(state.recentSends.first?.result == .failed && state.recentSends.first?.draft == state.draft,
+                        "Rejected save was not recoverable from history")
             try require(OfflineProtocol.pageRequests == 1 && !state.draft.submissionPending, "Rejected save state incorrect")
-            try require(try Self.state(root: root).draft == original, "Rejected save was not preserved on disk")
+            try require(try Self.state(root: root).draft == state.draft, "Rejected save was not preserved on disk")
             print("PASS: failed save preserves draft in memory and on disk")
 
             OfflineProtocol.pageStatus = 503; OfflineProtocol.pageRequests = 0
@@ -157,7 +186,8 @@ private final class OfflineProtocol: URLProtocol {
             OfflineProtocol.delay = 0
             try require(OfflineProtocol.pageRequests == 1 && savedCount == 1, "Concurrent save created duplicate pages")
             try require(state.draft.isEmpty && !state.draft.submissionPending, "Successful save did not clear draft")
-            try require(try state.store.read(Draft.self, name: "last-saved-draft")?.body == original.body, "Save recovery draft missing")
+            try require(state.recentSends.count == 1 && state.recentSends.first?.result == .sent &&
+                        state.recentSends.first?.draft.body == original.body, "Save recovery draft missing or retry duplicated history")
             print("PASS: concurrent save submits once and retains the saved draft receipt")
 
             var source = original
@@ -451,6 +481,15 @@ private final class OfflineProtocol: URLProtocol {
                 draft.images = [DraftImage(name: "kept.png", localFile: file, contentType: "image/png", byteCount: png.count)]
                 try cleanupStore.write(draft, name: name)
             }
+            var archived = Draft()
+            let archivedImage = try ImageAttachments.importData(png, name: "history.png", root: cleanupRoot)
+            archived.images = [archivedImage]
+            archived.submissionID = UUID()
+            let archivedURL = try ImageAttachments.url(for: archivedImage, root: cleanupRoot)
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: archivedURL.path)
+            let history = SendRecord(id: archived.submissionID!, destination: TestDestination.target, attemptedAt: old,
+                                     draft: archived, result: .failed)
+            try cleanupStore.write([history], name: SendRecord.filename)
             let orphan = attachmentFolder.appendingPathComponent(UUID().uuidString + ".png")
             let recentlyAdded = attachmentFolder.appendingPathComponent(UUID().uuidString + ".png")
             let unrelated = attachmentFolder.appendingPathComponent("unrelated.png")
@@ -466,7 +505,7 @@ private final class OfflineProtocol: URLProtocol {
             do { try ImageAttachments.tidyCache(root: cleanupRoot, now: today) { discarded.append($0) } }
             catch { }
             try require(discarded.isEmpty, "Cache cleanup ran despite an unreadable draft")
-            print("PASS: cache cleanup protects drafts, recovery files, recent copies and unknown files")
+            print("PASS: cache cleanup protects drafts, send history, recovery files, recent copies and unknown files")
             let mainTarget = NotionDestination(name: "Other Notes", databaseID: UUID(), dataSourceID: UUID())
             OfflineProtocol.alternateDestination = mainTarget
             let pageRequestsBeforeSetup = OfflineProtocol.pageRequests
@@ -607,7 +646,252 @@ private final class OfflineProtocol: URLProtocol {
                         "Clear left editor content behind or changed the destination")
             try require(try Self.state(root: clipRoot).draft == Draft(), "Cleared draft was restored on restart")
             print("PASS: clearing all inputs persists separately from destination and protects pending saves")
-            print("PASS: 20 app-level scenarios (isolated temporary data; no Keychain or real Notion requests)")
+            try await verifyBackgroundSend(root: root)
+            try await verifyHistoryRetries(root: root)
+            try await verifyHistoryLimit(root: root)
+            try await verifyBookmarkThumbnails(root: root, png: png)
+            try await verifyConversationImport(root: root)
+            print("PASS: app-level verification used isolated temporary data and offline transport")
         } catch { print("FAIL: \(error)"); exit(1) }
+    }
+
+    @MainActor private static func verifyBackgroundSend(root: URL) async throws {
+        let location = root.appendingPathComponent("background-send")
+        let state = try Self.state(root: location)
+        let writer = WriterWindow(state: state)
+        let window = writer.window!
+        state.draft.title = "バックグラウンドで送信"
+        state.draft.body = "下書きに先に保存される本文"
+        OfflineProtocol.pageStatus = 200
+        OfflineProtocol.schemaRequests = 0
+        let originalSchemaRequests = OfflineProtocol.schemaRequests
+        let initialPageRequests = OfflineProtocol.pageRequests
+        var acknowledged = false
+        var wasHidden = false
+        var preservedFirst = false
+        var beforeNetwork = false
+        var saved = false
+        state.submissionStarted = {
+            acknowledged = true
+            wasHidden = !window.isVisible
+            beforeNetwork = OfflineProtocol.schemaRequests == originalSchemaRequests && OfflineProtocol.pageRequests == initialPageRequests
+            let backup = try? Self.state(root: location)
+            preservedFirst = backup?.draft.body == state.draft.body && backup?.recentSends.first?.draft.body == state.draft.body
+        }
+        state.saved = { saved = true }
+        window.orderFrontRegardless()
+        try require(window.isVisible, "Composer was not open before sending")
+        writer.submit()
+        for _ in 0..<200 {
+            if acknowledged && !state.busy { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try require(acknowledged && beforeNetwork && wasHidden && preservedFirst,
+                    "Composer did not hide after committing both local copies and before any Notion request")
+        try require(saved && state.draft.isEmpty && !window.isVisible, "Confirmed save did not finish in the background")
+        print("PASS: AppKit composer hides after local backup and before the first Notion request")
+    }
+
+    @MainActor private static func verifyHistoryRetries(root: URL) async throws {
+        let location = root.appendingPathComponent("send-history")
+        let initial = try Self.state(root: location)
+        initial.draft.title = "以前の文章"
+        initial.draft.body = "前の本文\n\n空行と絵文字📝"
+        OfflineProtocol.pageStatus = 400
+        await initial.submit()
+        let first = initial.recentSends[0]
+
+        initial.draft.title = "新しい編集中の文章"
+        initial.draft.body = "編集メモ"
+        initial.edited()
+        try initial.flush()
+        let editor = initial.draft
+        let previousRequests = OfflineProtocol.pageRequests
+        let other = NotionDestination(name: "別の保存先", databaseID: UUID(), dataSourceID: UUID())
+        let differentDestination = try Self.state(root: location, destination: other)
+        await differentDestination.retry(first.id, confirmedMissing: true)
+        try require(OfflineProtocol.pageRequests == previousRequests, "History retry was redirected to another destination")
+
+        let restarted = try Self.state(root: location)
+        OfflineProtocol.pageStatus = 503
+        await restarted.retry(first.id, confirmedMissing: false)
+        let afterTimeout = try Self.state(root: location)
+        try require(afterTimeout.draft == editor && afterTimeout.recentSends.first?.result == .uncertain,
+                    "A historical retry replaced the active draft or lost its pending state")
+        let timeoutRequests = OfflineProtocol.pageRequests
+        await afterTimeout.retry(first.id, confirmedMissing: false)
+        try require(OfflineProtocol.pageRequests == timeoutRequests, "A result-unknown history item was resent without confirmation")
+        OfflineProtocol.pageStatus = 200
+        await afterTimeout.retry(first.id, confirmedMissing: true)
+        try require(OfflineProtocol.pageRequests == timeoutRequests + 1 && afterTimeout.draft == editor &&
+                    afterTimeout.recentSends.count == 1 && afterTimeout.recentSends.first?.result == .sent &&
+                    afterTimeout.recentSends.first?.draft.body == first.draft.body,
+                    "Confirmed retry lost the original content or touched the unrelated draft")
+        await afterTimeout.retry(first.id, confirmedMissing: true)
+        try require(OfflineProtocol.pageRequests == timeoutRequests + 1, "A completed history item was resent")
+
+        OfflineProtocol.pageStatus = 400
+        afterTimeout.draft.title = "同じ下書きを履歴から再送"
+        await afterTimeout.submit()
+        let sameDraftID = afterTimeout.recentSends[0].id
+        OfflineProtocol.pageStatus = 200
+        await afterTimeout.retry(sameDraftID, confirmedMissing: false)
+        try require(afterTimeout.draft.isEmpty, "Retry left an identical draft ready to send twice")
+
+        for index in 1...6 {
+            afterTimeout.draft.title = "送信\(index)"
+            await afterTimeout.submit()
+        }
+        let newest = try Self.state(root: location)
+        try require(newest.recentSends.map(\.draft.title) == ["送信6", "送信5", "送信4", "送信3", "送信2"],
+                    "History exceeded five entries or lost newest-first order on restart")
+        try require(newest.historyLimit == 5, "History did not default to five records")
+        print("PASS: history retry is scoped, deduplicated, restart-safe and keeps only the five newest sends")
+    }
+
+    @MainActor private static func verifyHistoryLimit(root: URL) async throws {
+        let domain = "NotionWriterVerify.History." + UUID().uuidString
+        let preferences = UserDefaults(suiteName: domain)!
+        defer { preferences.removePersistentDomain(forName: domain) }
+        let location = root.appendingPathComponent("history-limit")
+        let state = try Self.state(root: location, preferences: preferences)
+        let settings = SettingsWindow(state: state)
+        guard let tabs = settings.window?.contentView?.subviews.compactMap({ $0 as? NSTabView }).first,
+              let tab = tabs.tabViewItems.first(where: { $0.label == "履歴" }),
+              let scroll = tab.view as? NSScrollView,
+              let stack = scroll.documentView?.subviews.first as? NSStackView,
+              let menu = stack.arrangedSubviews.first as? NSPopUpButton else {
+            throw CheckFailure.failed("History retention menu is missing from the top of the history tab")
+        }
+
+        tabs.selectTabViewItem(tab)
+        try require(menu.itemTitles == ["5件まで保存", "10件まで保存", "20件まで保存", "50件まで保存", "100件まで保存"] &&
+                    menu.selectedItem?.tag == 5, "History retention menu has incorrect choices or default")
+        menu.selectItem(withTag: 100)
+        if let action = menu.action { NSApp.sendAction(action, to: menu.target, from: menu) }
+        try require(state.historyLimit == 100, "The retention menu did not update the app setting")
+
+        let time = Date()
+        let records: [SendRecord] = (1...100).reversed().map { index in
+            var draft = Draft()
+            draft.title = "既存の履歴\(index)"
+            return SendRecord(id: UUID(), destination: TestDestination.target, attemptedAt: time.addingTimeInterval(Double(index - 101)),
+                              draft: draft, result: .sent)
+        }
+        try state.store.write(records, name: SendRecord.filename)
+        let restarted = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(restarted.historyLimit == 100 && restarted.recentSends.count == 100,
+                    "The selected limit and the existing 100 records were not restored")
+        restarted.draft.title = "新しい送信"
+        OfflineProtocol.pageStatus = 200
+        await restarted.submit()
+        try require(restarted.recentSends.count == 100 && restarted.recentSends.first?.draft.title == "新しい送信" &&
+                    restarted.recentSends.last?.draft.title == "既存の履歴2", "The 100-entry cap did not retain the newest records")
+
+        let pendingDraft = Draft()
+        restarted.draft = pendingDraft
+        try restarted.setHistoryLimit(20)
+        let stored = try restarted.store.read([SendRecord].self, name: SendRecord.filename)
+        try require(stored?.count == 20 && stored?.last?.draft.title == "既存の履歴82" &&
+                    restarted.draft == pendingDraft, "Reducing the limit did not persist pruning or changed the editor draft")
+        let reduced = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(reduced.historyLimit == 20 && reduced.recentSends == stored, "The reduced history limit was lost on restart")
+        try reduced.setHistoryLimit(50)
+        let expanded = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(expanded.historyLimit == 50 && expanded.recentSends == stored, "Increasing the limit restored deleted history")
+        print("PASS: history limit menu, restart, 100-entry cap and newest-first pruning")
+    }
+
+    @MainActor private static func verifyBookmarkThumbnails(root: URL, png: Data) async throws {
+        let thumbnailURL = URL(string: "https://example.org/preview")!
+        let bareURL = URL(string: "https://example.org/no-preview")!
+        guard let jpeg = BookmarkPreview.jpegThumbnail(png) else { throw CheckFailure.failed("Bookmark thumbnail did not convert") }
+        let location = root.appendingPathComponent("thumbnail-send")
+        let domain = "NotionWriterVerify.Bookmarks." + UUID().uuidString
+        let preferences = UserDefaults(suiteName: domain)!
+        defer { preferences.removePersistentDomain(forName: domain) }
+        let lookups = BookmarkLookups()
+        let preview: @Sendable (URL) async -> BookmarkPreview? = { url in
+            await lookups.record()
+            return url == thumbnailURL ? BookmarkPreview(title: "記事のタイトル", summary: "記事の説明", thumbnail: jpeg) : nil
+        }
+        let state = try Self.state(root: location, preferences: preferences, preview: preview)
+        let writer = WriterWindow(state: state)
+        writer.toggleBody()
+        try require(writer.bodyEditor.pasteMarkdown("リンクの前"), "Missing text to check block order")
+        for url in [thumbnailURL, bareURL, thumbnailURL] {
+            let end = NSRange(location: writer.bodyEditor.string.utf16.count, length: 0)
+            try require(writer.bodyEditor.insertWebBlocks(BodyBookmarkAttachment.fragment(url, font: .systemFont(ofSize: 14)), replacing: end),
+                        "Could not insert bookmark fixture")
+        }
+        state.draft.title = "サムネイル付きの送信"
+        let draft = state.draft
+        let expectedTypes = ["paragraph", "callout", "bookmark", "callout"]
+        OfflineProtocol.uploadCount = 0
+        OfflineProtocol.pageStatus = 200
+        await state.submit()
+        let page = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+        let blocks = page?["children"] as? [[String: Any]] ?? []
+        try require(state.draft.isEmpty && OfflineProtocol.uploadCount == 1 && blocks.compactMap { $0["type"] as? String } == expectedTypes,
+                    "Bookmark callout lost block order, the fallback, or the shared upload")
+        let callout = blocks[1]["callout"] as? [String: Any]
+        let text = callout?["rich_text"] as? [[String: Any]]
+        let title = text?.first?["text"] as? [String: Any]
+        let summary = text?.last?["text"] as? [String: Any]
+        let images = callout?["children"] as? [[String: Any]]
+        let image = images?.first?["image"] as? [String: Any]
+        try require(title?["content"] as? String == "記事のタイトル" &&
+                    (title?["link"] as? [String: String])?["url"] == thumbnailURL.absoluteString &&
+                    summary?["content"] as? String == "\n記事の説明" &&
+                    (image?["file_upload"] as? [String: String])?["id"] == OfflineProtocol.uploadIDs[0] &&
+                    PagePayload.bookmarkURL(in: blocks[2]) == bareURL,
+                    "Notion payload lost the thumbnail, the click target or the text")
+        let recordedBlocks = try PagePayload.bodyBlocks(state.recentSends[0].draft)
+        try require(recordedBlocks.compactMap(PagePayload.bookmarkURL(in:)) == [thumbnailURL, bareURL, thumbnailURL],
+                    "The history backup lost the source bookmarks")
+
+        state.draft = draft
+        OfflineProtocol.rejectUpload = true
+        await state.submit()
+        OfflineProtocol.rejectUpload = false
+        let fallback = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+        let fallbackBlocks = fallback?["children"] as? [[String: Any]] ?? []
+        try require(state.draft.isEmpty && fallbackBlocks.compactMap(PagePayload.bookmarkURL(in:)) == [thumbnailURL, bareURL, thumbnailURL],
+                    "An optional thumbnail upload blocked page creation or lost the bookmark")
+        let settings = SettingsWindow(state: state)
+        guard let tabs = settings.window?.contentView?.subviews.compactMap({ $0 as? NSTabView }).first,
+              let general = tabs.tabViewItems.first(where: { $0.label == "一般" }),
+              let stack = general.view?.subviews.first as? NSStackView,
+              let menu = stack.arrangedSubviews.compactMap({ $0 as? NSPopUpButton }).first else {
+            throw CheckFailure.failed("General settings are missing the bookmark menu")
+        }
+        try require(menu.itemTitles == ["URLだけ貼る", "サムネイル付きカード"] &&
+                    menu.titleOfSelectedItem == "サムネイル付きカード", "Bookmark choices or the default are incorrect")
+        menu.selectItem(withTitle: "URLだけ貼る")
+        if let action = menu.action { NSApp.sendAction(action, to: menu.target, from: menu) }
+        let restarted = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!, preview: preview)
+        try require(restarted.bookmarkMode == .urlOnly, "Bookmark setting was not restored")
+
+        let previousLookups = await lookups.count
+        let previousUploads = OfflineProtocol.uploadCount
+        restarted.draft = draft
+        await restarted.submit()
+        let plain = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+        let plainBlocks = plain?["children"] as? [[String: Any]] ?? []
+        let outgoingURLs = plainBlocks.dropFirst().compactMap { block -> String? in
+            let paragraph = block["paragraph"] as? [String: Any]
+            let runs = paragraph?["rich_text"] as? [[String: Any]]
+            guard runs?.count == 1, let value = runs?.first?["text"] as? [String: Any],
+                  let content = value["content"] as? String, (value["link"] as? [String: String])?["url"] == content else {
+                return nil
+            }
+            return content
+        }
+        let currentLookups = await lookups.count
+        try require(restarted.draft.isEmpty && plainBlocks.allSatisfy { $0["type"] as? String == "paragraph" } &&
+                    outgoingURLs == [thumbnailURL, bareURL, thumbnailURL].map(\.absoluteString) &&
+                    previousLookups == currentLookups && previousUploads == OfflineProtocol.uploadCount,
+                    "URL-only delivery looked up previews, uploaded thumbnails, or lost the original links")
+        print("PASS: bookmark menu persists URL-only and thumbnail-card sends, keeping order and links")
     }
 }

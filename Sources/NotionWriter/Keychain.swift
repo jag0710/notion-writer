@@ -3,7 +3,7 @@ import Security
 
 enum Keychain {
     static func query(_ databaseID: String) -> [String: Any] {
-        let service = "io.github.jag0710.notion-writer"
+        let service = Bundle.main.bundleIdentifier ?? "io.github.jag0710.notion-writer"
         return [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: databaseID]
     }
     static func read(_ databaseID: String) throws -> String? {

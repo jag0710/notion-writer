@@ -1,7 +1,7 @@
 import AppKit
 import NotionWriterCore
 
-@MainActor final class SettingsWindow: NSWindowController {
+@MainActor final class SettingsWindow: NSWindowController, NSTabViewDelegate {
     let state: AppState
     let database = NSTextField()
     let openDatabaseButton = NSButton()
@@ -25,14 +25,30 @@ import NotionWriterCore
     var sizeSliders: [String: NSSlider] = [:]
     var sizeLabels: [String: NSTextField] = [:]
     var shortcutChanged: ((Shortcut) -> String?)?
+    private let tabs = NSTabView()
+    private let bookmarkModeButton = NSPopUpButton()
+    private let historyLimitButton = NSPopUpButton()
+    private let historyRows = stack(.vertical, spacing: 14)
+    private let aiStudioDetail = label("", size: 12, color: .secondaryLabelColor)
+    private let disconnectAIStudioButton = NSButton(title: "ファイル接続を解除", target: nil, action: nil)
+    private let historyMessage = label("", size: 11, color: .secondaryLabelColor)
+    private var renderedHistory: [SendRecord] = []
+    private var historyButtons: [(SendRecord, NSButton)] = []
+    private let historyDates: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     init(state: AppState) {
         self.state = state
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 560), styleMask: [.titled,.closable], backing: .buffered, defer: false)
-        window.title = "Notion Writer 設定"; window.level = .floating; window.appearance = NSAppearance(named: .aqua)
+        let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Notion Writer"
+        window.title = appName + " 設定"; window.level = .floating; window.appearance = NSAppearance(named: .aqua)
         window.backgroundColor = .white; window.isReleasedWhenClosed = false
         super.init(window: window)
-        let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.translatesAutoresizingMaskIntoConstraints = false
         window.contentView!.addSubview(tabs)
         NSLayoutConstraint.activate([
             tabs.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 12),
@@ -42,9 +58,12 @@ import NotionWriterCore
             window.contentView!.widthAnchor.constraint(greaterThanOrEqualToConstant: 580),
             window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: 560)
         ])
-        buildConnectionTab(addTab("Notion", to: tabs, scrollable: true))
+        buildConnectionTab(addTab("Notionへの接続", to: tabs, scrollable: true))
         buildDisplayTab(addTab("表示", to: tabs))
         buildGeneralTab(addTab("一般", to: tabs))
+        buildHistoryTab(addTab("履歴", to: tabs, scrollable: true))
+        buildConversationTab(addTab("対話取り込み", to: tabs))
+        tabs.delegate = self
         window.setContentSize(NSSize(width: 580, height: 560)); window.center(); update()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -82,6 +101,187 @@ import NotionWriterCore
         field.setContentCompressionResistancePriority(.required, for: .vertical)
         root.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
+    private func buildConversationTab(_ root: NSStackView) {
+        root.addArrangedSubview(label("Google AI Studio", size: 16))
+        root.addArrangedSubview(aiStudioDetail)
+        explain("アプリでは、最初に対話URLを入力したときに選んだGoogle Driveの対話ファイルを読み取ります。Googleアカウントのログインはブラウザで行います。", in: root)
+        disconnectAIStudioButton.target = self
+        disconnectAIStudioButton.action = #selector(disconnectAIStudio)
+        root.addArrangedSubview(disconnectAIStudioButton)
+    }
+
+    @objc private func disconnectAIStudio() {
+        do { try state.disconnectAIStudioFiles(); update() }
+        catch { NSAlert(error: error).runModal() }
+    }
+
+    private func buildHistoryTab(_ root: NSStackView) {
+        for limit in SendRecord.limits {
+            historyLimitButton.addItem(withTitle: "\(limit)件まで保存")
+            historyLimitButton.lastItem?.tag = limit
+        }
+        historyLimitButton.setAccessibilityLabel("履歴の保存上限")
+        historyLimitButton.target = self
+        historyLimitButton.action = #selector(historyLimitChanged(_:))
+        root.addArrangedSubview(historyLimitButton)
+        explain("送信内容はこのMacに保存します。未送信の内容は元の保存先へ再送できます。", in: root)
+        historyMessage.maximumNumberOfLines = 0
+        historyMessage.lineBreakMode = .byWordWrapping
+        historyMessage.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        root.addArrangedSubview(historyMessage)
+        root.addArrangedSubview(historyRows)
+        NSLayoutConstraint.activate([
+            historyMessage.widthAnchor.constraint(equalTo: root.widthAnchor),
+            historyRows.widthAnchor.constraint(equalTo: root.widthAnchor),
+        ])
+        explain("送信先を変更した場合は、元の保存先に接続すると再送できます。", in: root)
+    }
+
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        if tabViewItem?.identifier as? String == "履歴" { updateHistory() }
+    }
+
+    @objc private func historyLimitChanged(_ sender: NSPopUpButton) {
+        guard let limit = sender.selectedItem?.tag, limit != state.historyLimit else { return }
+        defer { updateHistory() }
+        let removed = state.recentSends.count - limit
+        if removed > 0 {
+            let alert = NSAlert()
+            alert.messageText = "履歴の上限を\(limit)件に変更しますか？"
+            alert.informativeText = "このMacに保存した古い履歴\(removed)件を削除します。"
+            alert.addButton(withTitle: "キャンセル")
+            alert.addButton(withTitle: "変更して削除")
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        do { try state.setHistoryLimit(limit) }
+        catch { NSAlert(error: error).runModal() }
+    }
+
+    private func updateHistory() {
+        historyLimitButton.selectItem(withTag: state.historyLimit)
+        historyLimitButton.isEnabled = !state.busy
+        let records = state.recentSends
+        if renderedHistory != records {
+            for view in historyRows.arrangedSubviews {
+                historyRows.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            historyButtons = []
+            for record in records {
+                let row = stack(.vertical, spacing: 5)
+                let heading = record.draft.title.split(whereSeparator: \.isNewline).first
+                let title = label(heading.map(String.init) ?? record.draft.title, size: 13)
+                title.maximumNumberOfLines = 1
+                title.lineBreakMode = .byTruncatingTail
+                title.toolTip = String(record.draft.title.prefix(500))
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                row.addArrangedSubview(title)
+                let detail = label(historyDates.string(from: record.attemptedAt) + "  ·  " + record.destination.name,
+                                   size: 11, color: .secondaryLabelColor)
+                detail.lineBreakMode = .byTruncatingTail
+                detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                row.addArrangedSubview(detail)
+
+                let actions = stack(.horizontal, spacing: 8)
+                let preview = NSButton(title: "内容を表示…", target: self, action: #selector(showHistoryContent(_:)))
+                preview.identifier = NSUserInterfaceItemIdentifier(record.id.uuidString)
+                actions.addArrangedSubview(preview)
+                if record.result != .sent || record.notionURL != nil {
+                    let button = NSButton(title: "", target: self, action: #selector(historyAction(_:)))
+                    button.identifier = preview.identifier
+                    actions.addArrangedSubview(button)
+                    historyButtons.append((record, button))
+                } else {
+                    actions.addArrangedSubview(label("送信済み", size: 11, color: .secondaryLabelColor))
+                }
+                row.addArrangedSubview(actions)
+                historyRows.addArrangedSubview(row)
+                NSLayoutConstraint.activate([
+                    row.widthAnchor.constraint(equalTo: historyRows.widthAnchor),
+                    title.widthAnchor.constraint(equalTo: row.widthAnchor),
+                    detail.widthAnchor.constraint(equalTo: row.widthAnchor),
+                ])
+            }
+            renderedHistory = records
+        }
+        historyMessage.stringValue = state.historyFeedback ?? (records.isEmpty ? "送信履歴はまだありません。" : "")
+        historyMessage.isHidden = historyMessage.stringValue.isEmpty
+        for (record, button) in historyButtons {
+            let sending = state.sendingID == record.id
+            if sending {
+                button.title = "送信中…"
+            } else {
+                switch record.result {
+                case .sent: button.title = "送信済み · Notionで開く"
+                case .failed: button.title = "未送信 · 再送…"
+                case .uncertain: button.title = "結果を要確認…"
+                }
+            }
+            button.isEnabled = !sending && (record.result == .sent || state.canRetry(record) || record.notionURL != nil)
+        }
+    }
+
+    private func historyRecord(for sender: NSButton) -> SendRecord? {
+        guard let key = sender.identifier?.rawValue, let id = UUID(uuidString: key) else { return nil }
+        return state.recentSends.first { $0.id == id }
+    }
+
+    @objc private func showHistoryContent(_ sender: NSButton) {
+        guard let record = historyRecord(for: sender) else { return }
+        let alert = NSAlert()
+        alert.messageText = "送信内容"
+        alert.informativeText = record.destination.name + "  ·  " + record.result.label
+        alert.addButton(withTitle: "閉じる")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let body = NSTextView(frame: scroll.bounds)
+        body.isEditable = false
+        body.isSelectable = true
+        body.isRichText = false
+        body.font = .systemFont(ofSize: 13)
+        body.textContainerInset = NSSize(width: 8, height: 8)
+        body.autoresizingMask = [.width]
+        body.isVerticallyResizable = true
+        body.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        body.textContainer?.widthTracksTextView = true
+        let draft = record.draft
+        let links = (try? PagePayload.bodyBlocks(draft))?.compactMap(PagePayload.bookmarkURL(in:)).map(\.absoluteString) ?? []
+        let contents = draft.body.replacingOccurrences(of: "\u{fffc}", with: "")
+        let images = draft.images.isEmpty ? [] : ["添付画像（\(draft.images.count)枚）\n" + draft.images.map(\.name).joined(separator: "\n")]
+        body.string = ([draft.title, contents] + draft.urls.values.sorted() + links + images)
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        scroll.documentView = body
+        alert.accessoryView = scroll
+        alert.runModal()
+    }
+
+    @objc private func historyAction(_ sender: NSButton) {
+        guard let record = historyRecord(for: sender) else { return }
+        if record.result == .sent {
+            if let url = record.notionURL { NSWorkspace.shared.open(url) }
+            return
+        }
+        let uncertain = record.result == .uncertain
+        let retry = state.canRetry(record)
+        let alert = NSAlert()
+        alert.messageText = uncertain ? "Notionで保存結果を確認してください" : "元の保存先へ再送しますか？"
+        alert.informativeText = record.destination.name
+        if uncertain {
+            alert.informativeText += "\n\nNotionに同じページがあるか確認してください。途中まで保存されたページがある場合は、内容を確認して整理してから再送してください。"
+        }
+        alert.addButton(withTitle: "キャンセル")
+        if retry { alert.addButton(withTitle: uncertain ? "未保存を確認・再送" : "再送") }
+        if record.notionURL != nil { alert.addButton(withTitle: "Notionで確認") }
+        let result = alert.runModal()
+        if retry && result == .alertSecondButtonReturn {
+            Task { await state.retry(record.id, confirmedMissing: uncertain) }
+        } else if let url = record.notionURL,
+                  result == (retry ? .alertThirdButtonReturn : .alertSecondButtonReturn) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     private func linkButton(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.isBordered = false; button.contentTintColor = .linkColor; button.alignment = .left
@@ -192,6 +392,18 @@ import NotionWriterCore
         sizeSliders[id] = slider; sizeLabels[id] = value
     }
     private func buildGeneralTab(_ root: NSStackView) {
+        root.addArrangedSubview(label("Notionに送るブックマーク", size: 16))
+        for mode in PagePayload.BookmarkMode.allCases {
+            let title = mode == .urlOnly ? "URLだけ貼る" : "サムネイル付きカード"
+            bookmarkModeButton.addItem(withTitle: title)
+            bookmarkModeButton.lastItem?.representedObject = mode.rawValue
+        }
+        bookmarkModeButton.setAccessibilityLabel("Notionに送るブックマーク")
+        bookmarkModeButton.target = self
+        bookmarkModeButton.action = #selector(bookmarkModeChanged(_:))
+        root.addArrangedSubview(bookmarkModeButton)
+        explain("本文に入れたブックマークに、Notionへの送信時に適用します。", in: root)
+
         root.addArrangedSubview(label("キーボードショートカット", size: 16))
         let openRecorder = ShortcutRecorder(shortcut: .load())
         let clearRecorder = ShortcutRecorder(shortcut: state.clearShortcut)
@@ -252,7 +464,21 @@ import NotionWriterCore
         shortcutMessage.isHidden = warning == nil
     }
     func show() { update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil) }
+    @objc private func bookmarkModeChanged(_ sender: NSPopUpButton) {
+        guard let value = sender.selectedItem?.representedObject as? String,
+              let mode = PagePayload.BookmarkMode(rawValue: value) else { return }
+        state.setBookmarkMode(mode)
+    }
+
     func update() {
+        if tabs.selectedTabViewItem?.identifier as? String == "履歴" { updateHistory() }
+        let bookmarkModeIndex = bookmarkModeButton.itemArray.firstIndex {
+            $0.representedObject as? String == state.bookmarkMode.rawValue
+        }
+        if let bookmarkModeIndex { bookmarkModeButton.selectItem(at: bookmarkModeIndex) }
+        let fileCount = state.aiStudioFileCount
+        aiStudioDetail.stringValue = fileCount == 0 ? "接続しているファイルはありません。" : "接続済みの対話ファイル  \(fileCount)件"
+        disconnectAIStudioButton.isEnabled = fileCount > 0 && !state.importingImages
         connectButton.isEnabled = !state.busy && !state.syncing && !state.importingImages && !connecting
         database.isEnabled = connectButton.isEnabled
         token.isEnabled = connectButton.isEnabled
