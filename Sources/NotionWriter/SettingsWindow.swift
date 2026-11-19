@@ -1,7 +1,7 @@
 import AppKit
 import NotionWriterCore
 
-@MainActor final class SettingsWindow: NSWindowController {
+@MainActor final class SettingsWindow: NSWindowController, NSTabViewDelegate {
     let state: AppState
     let database = NSTextField()
     let openDatabaseButton = NSButton()
@@ -25,6 +25,9 @@ import NotionWriterCore
     var sizeSliders: [String: NSSlider] = [:]
     var sizeLabels: [String: NSTextField] = [:]
     var shortcutChanged: ((Shortcut) -> String?)?
+    private let tabs = NSTabView()
+    private let bookmarkModeButton = NSPopUpButton()
+    private let historyLimitButton = NSPopUpButton()
     private let historyRows = stack(.vertical, spacing: 14)
     private let historyMessage = label("", size: 11, color: .secondaryLabelColor)
     private var renderedHistory: [SendRecord] = []
@@ -43,7 +46,7 @@ import NotionWriterCore
         window.title = appName + " 設定"; window.level = .floating; window.appearance = NSAppearance(named: .aqua)
         window.backgroundColor = .white; window.isReleasedWhenClosed = false
         super.init(window: window)
-        let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.translatesAutoresizingMaskIntoConstraints = false
         window.contentView!.addSubview(tabs)
         NSLayoutConstraint.activate([
             tabs.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 12),
@@ -56,7 +59,8 @@ import NotionWriterCore
         buildConnectionTab(addTab("Notion", to: tabs, scrollable: true))
         buildDisplayTab(addTab("表示", to: tabs))
         buildGeneralTab(addTab("一般", to: tabs))
-        buildHistoryTab(addTab("直近5件", to: tabs, scrollable: true))
+        buildHistoryTab(addTab("履歴", to: tabs, scrollable: true))
+        tabs.delegate = self
         window.setContentSize(NSSize(width: 580, height: 560)); window.center(); update()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -95,7 +99,15 @@ import NotionWriterCore
         root.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
     private func buildHistoryTab(_ root: NSStackView) {
-        explain("送信した内容をこのMacに5件まで保存します。未送信の内容は元の保存先へ再送できます。", in: root)
+        for limit in SendRecord.limits {
+            historyLimitButton.addItem(withTitle: "\(limit)件まで保存")
+            historyLimitButton.lastItem?.tag = limit
+        }
+        historyLimitButton.setAccessibilityLabel("履歴の保存上限")
+        historyLimitButton.target = self
+        historyLimitButton.action = #selector(historyLimitChanged(_:))
+        root.addArrangedSubview(historyLimitButton)
+        explain("送信内容はこのMacに保存します。未送信の内容は元の保存先へ再送できます。", in: root)
         historyMessage.maximumNumberOfLines = 0
         historyMessage.lineBreakMode = .byWordWrapping
         historyMessage.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -108,7 +120,29 @@ import NotionWriterCore
         explain("送信先を変更した場合は、元の保存先に接続すると再送できます。", in: root)
     }
 
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        if tabViewItem?.identifier as? String == "履歴" { updateHistory() }
+    }
+
+    @objc private func historyLimitChanged(_ sender: NSPopUpButton) {
+        guard let limit = sender.selectedItem?.tag, limit != state.historyLimit else { return }
+        defer { updateHistory() }
+        let removed = state.recentSends.count - limit
+        if removed > 0 {
+            let alert = NSAlert()
+            alert.messageText = "履歴の上限を\(limit)件に変更しますか？"
+            alert.informativeText = "このMacに保存した古い履歴\(removed)件を削除します。"
+            alert.addButton(withTitle: "キャンセル")
+            alert.addButton(withTitle: "変更して削除")
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        do { try state.setHistoryLimit(limit) }
+        catch { NSAlert(error: error).runModal() }
+    }
+
     private func updateHistory() {
+        historyLimitButton.selectItem(withTag: state.historyLimit)
+        historyLimitButton.isEnabled = !state.busy
         let records = state.recentSends
         if renderedHistory != records {
             for view in historyRows.arrangedSubviews {
@@ -341,6 +375,18 @@ import NotionWriterCore
         sizeSliders[id] = slider; sizeLabels[id] = value
     }
     private func buildGeneralTab(_ root: NSStackView) {
+        root.addArrangedSubview(label("Notionに送るブックマーク", size: 16))
+        for mode in PagePayload.BookmarkMode.allCases {
+            let title = mode == .urlOnly ? "URLだけ貼る" : "サムネイル付きカード"
+            bookmarkModeButton.addItem(withTitle: title)
+            bookmarkModeButton.lastItem?.representedObject = mode.rawValue
+        }
+        bookmarkModeButton.setAccessibilityLabel("Notionに送るブックマーク")
+        bookmarkModeButton.target = self
+        bookmarkModeButton.action = #selector(bookmarkModeChanged(_:))
+        root.addArrangedSubview(bookmarkModeButton)
+        explain("本文に入れたブックマークに、Notionへの送信時に適用します。", in: root)
+
         root.addArrangedSubview(label("キーボードショートカット", size: 16))
         let openRecorder = ShortcutRecorder(shortcut: .load())
         let clearRecorder = ShortcutRecorder(shortcut: state.clearShortcut)
@@ -401,8 +447,18 @@ import NotionWriterCore
         shortcutMessage.isHidden = warning == nil
     }
     func show() { update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil) }
+    @objc private func bookmarkModeChanged(_ sender: NSPopUpButton) {
+        guard let value = sender.selectedItem?.representedObject as? String,
+              let mode = PagePayload.BookmarkMode(rawValue: value) else { return }
+        state.setBookmarkMode(mode)
+    }
+
     func update() {
-        updateHistory()
+        if tabs.selectedTabViewItem?.identifier as? String == "履歴" { updateHistory() }
+        let bookmarkModeIndex = bookmarkModeButton.itemArray.firstIndex {
+            $0.representedObject as? String == state.bookmarkMode.rawValue
+        }
+        if let bookmarkModeIndex { bookmarkModeButton.selectItem(at: bookmarkModeIndex) }
         connectButton.isEnabled = !state.busy && !state.syncing && !state.importingImages && !connecting
         database.isEnabled = connectButton.isEnabled
         token.isEnabled = connectButton.isEnabled

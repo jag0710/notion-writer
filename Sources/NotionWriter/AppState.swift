@@ -2,7 +2,13 @@ import AppKit
 import NotionWriterCore
 
 @MainActor final class AppState {
+    private static let bookmarkModeKey = "notionBookmarkMode"
+    private static let historyLimitKey = "sendHistoryLimit"
+
     let store: LocalStore
+    private let preferences: UserDefaults
+    private(set) var bookmarkMode: PagePayload.BookmarkMode
+    private(set) var historyLimit: Int
     private(set) var activeDestination: NotionDestination?
     var connection: Connection? { activeDestination?.connection }
     var schema: Schema?
@@ -33,10 +39,15 @@ import NotionWriterCore
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
     init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil,
+         preferences: UserDefaults = .standard,
          bookmarkPreview: @escaping @Sendable (URL) async -> BookmarkPreview? = { await BookmarkPreviews.shared.load($0) }) throws {
         self.clientOverride = clientOverride
         self.bookmarkPreview = bookmarkPreview
         self.qa = qa
+        self.preferences = preferences
+        bookmarkMode = preferences.string(forKey: Self.bookmarkModeKey).flatMap(PagePayload.BookmarkMode.init(rawValue:)) ?? .richCard
+        let savedLimit = preferences.integer(forKey: Self.historyLimitKey)
+        historyLimit = SendRecord.limits.contains(savedLimit) ? savedLimit : SendRecord.defaultLimit
         let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Notion Writer"
         let base = if let dataRoot {
             dataRoot
@@ -53,10 +64,28 @@ import NotionWriterCore
         activeDestination = destination
         schema = try local.read(Schema.self, name: cacheName(storedConnection))
         draft = try local.read(Draft.self, name: local.draftName(for: storedConnection)) ?? Draft()
-        recentSends = try SendRecord.load(from: local, destination: destination)
+        recentSends = Array(try SendRecord.load(from: local, destination: destination).prefix(historyLimit))
         if draft.submissionPending { status = pendingSaveMessage }
         else if let target = activeDestination { status = target.name + " · キャッシュを表示中" }
     }
+    func setBookmarkMode(_ mode: PagePayload.BookmarkMode) {
+        bookmarkMode = mode
+        preferences.set(mode.rawValue, forKey: Self.bookmarkModeKey)
+        updated?()
+    }
+
+    func setHistoryLimit(_ limit: Int) throws {
+        guard !busy, SendRecord.limits.contains(limit), limit != historyLimit else { return }
+        if recentSends.count > limit {
+            let retained = Array(recentSends.prefix(limit))
+            try store.write(retained, name: SendRecord.filename)
+            recentSends = retained
+        }
+        historyLimit = limit
+        preferences.set(limit, forKey: Self.historyLimitKey)
+        updated?()
+    }
+
     func setDisplay(_ value: DisplayPreferences) {
         display = value.normalized(); display.save(); updated?()
     }
@@ -196,7 +225,7 @@ import NotionWriterCore
 
     private func saveRecord(_ record: SendRecord) throws {
         let otherRecords = recentSends.filter { $0.id != record.id }
-        let next = Array(([record] + otherRecords).sorted { $0.attemptedAt > $1.attemptedAt }.prefix(SendRecord.limit))
+        let next = Array(([record] + otherRecords).sorted { $0.attemptedAt > $1.attemptedAt }.prefix(historyLimit))
         try store.write(next, name: SendRecord.filename)
         recentSends = next
     }
@@ -210,6 +239,7 @@ import NotionWriterCore
 
     private func deliver(_ source: SendRecord, to target: NotionDestination, tracksEditor: Bool,
                          fromHistory: Bool = false, onAccepted: (() -> Void)? = nil) async {
+        let mode = bookmarkMode
         var record = source
         var accepted = false
         defer {
@@ -245,9 +275,10 @@ import NotionWriterCore
             var fresh = try await api.fetchSchema(destination: target)
             let placeholder = "00000000-0000-0000-0000-000000000000"
             let placeholders = Dictionary(record.draft.images.map { ($0.id, placeholder) }, uniquingKeysWith: { first, _ in first })
-            _ = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: placeholders, destination: target)
+            _ = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: placeholders,
+                                        bookmarkMode: mode, destination: target)
 
-            let bookmarkURLs = blocks.compactMap(PagePayload.bookmarkURL(in:))
+            let bookmarkURLs = mode == .richCard ? blocks.compactMap(PagePayload.bookmarkURL(in:)) : []
             let previews = try await prepareBookmarks(bookmarkURLs, using: api)
             var uploadedImages: [String: String] = [:]
             var uploadedDuringSave = previews.values.contains { $0.thumbnailUploadID != nil }
@@ -270,7 +301,7 @@ import NotionWriterCore
             }
             if uploadedDuringSave { fresh = try await api.fetchSchema(destination: target) }
             let delivery = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: uploadedImages,
-                                                   bookmarkPreviews: previews, destination: target)
+                                                   bookmarkMode: mode, bookmarkPreviews: previews, destination: target)
             status = "ページを保存中…"
             updated?()
             try store.write(fresh, name: cacheName(connection))

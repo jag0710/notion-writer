@@ -118,6 +118,10 @@ public enum PagePayload {
         return delivery.create
     }
 
+    public enum BookmarkMode: String, CaseIterable, Sendable {
+        case urlOnly, richCard
+    }
+
     public struct BookmarkPreview: Sendable {
         public let title: String
         public let summary: String?
@@ -160,7 +164,8 @@ public enum PagePayload {
     }
 
     public static func prepare(draft: Draft, schema: Schema, uploadedImages: [String: String] = [:],
-                               bookmarkPreviews: [URL: BookmarkPreview] = [:], destination: NotionDestination) throws -> Delivery {
+                               bookmarkMode: BookmarkMode = .richCard, bookmarkPreviews: [URL: BookmarkPreview] = [:],
+                               destination: NotionDestination) throws -> Delivery {
         try destination.validate(schema)
         guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WriterError.validation("文章を入力してください。") }
         guard let title = schema.properties.first(where: { $0.type == "title" }) else { throw WriterError.validation("タイトルプロパティが見つかりません。再同期してください。") }
@@ -182,8 +187,13 @@ public enum PagePayload {
         let body: [String: Any] = ["parent": ["type": "data_source_id", "data_source_id": schema.dataSourceID], "properties": properties]
         let images = Set(draft.images.map(\.id))
         let children = try bodyWithImages(draft).map { block in
-            if let url = bookmarkURL(in: block), let preview = bookmarkPreviews[url] {
-                return bookmarkBlock(block, url: url, preview: preview)
+            if let url = bookmarkURL(in: block) {
+                if bookmarkMode == .urlOnly {
+                    let address = url.absoluteString
+                    let text: [String: Any] = ["type": "text", "text": ["content": address, "link": ["url": address]]]
+                    return ["object": "block", "type": "paragraph", "paragraph": ["rich_text": [text]]]
+                }
+                if let preview = bookmarkPreviews[url] { return bookmarkBlock(block, url: url, preview: preview) }
             }
             guard let imageID = imageReferenceID(block) else { return block }
             guard images.contains(imageID), let uploadID = uploadedImages[imageID], UUID(uuidString: uploadID) != nil else {

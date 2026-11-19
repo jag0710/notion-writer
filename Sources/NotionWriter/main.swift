@@ -19,11 +19,14 @@ import NotionWriterCore
             alert.runModal(); NSApp.terminate(nil); return
         }
         if !state.qa { try? ImageAttachments.tidyCache(root: state.store.root) }
-        state.updated = { [weak self] in self?.writer?.update(); self?.settings?.update() }
+        state.updated = { [weak self] in
+            self?.writer?.update()
+            if self?.settings?.window?.isVisible == true { self?.settings?.update() }
+        }
         state.submissionStarted = { [weak self] in self?.setStatusMark() }
         state.saved = { [weak self] in self?.showSuccess() }
         state.submissionFailed = { [weak self] in
-            self?.setStatusMark("!", help: "送信を確認してください。設定の「直近5件」で状態を確認できます。")
+            self?.setStatusMark("!", help: "送信を確認してください。設定の「履歴」で状態を確認できます。")
         }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let url = Bundle.main.url(forResource: "WriterIcon", withExtension: "png"), let original = NSImage(contentsOf: url) {

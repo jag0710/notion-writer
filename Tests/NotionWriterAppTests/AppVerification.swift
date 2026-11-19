@@ -115,14 +115,22 @@ private final class OfflineProtocol: URLProtocol {
     }
 }
 
+private actor BookmarkLookups {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
 @main struct AppVerification {
+    private static let isolatedPreferences = UserDefaults(suiteName: "NotionWriterVerify." + UUID().uuidString)!
+
     @MainActor static func state(root: URL, destination: NotionDestination = TestDestination.target,
+                                preferences: UserDefaults = isolatedPreferences,
                                 preview: @escaping @Sendable (URL) async -> BookmarkPreview? = { _ in nil }) throws -> AppState {
         let store = try LocalStore(root: root)
         try store.write(destination, name: "destination")
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [OfflineProtocol.self]
         let api = NotionClient(token: "offline-test-only", session: URLSession(configuration: config))
-        return try AppState(qa: false, dataRoot: root, clientOverride: { api }, bookmarkPreview: preview)
+        return try AppState(qa: false, dataRoot: root, clientOverride: { api }, preferences: preferences, bookmarkPreview: preview)
     }
     @MainActor static func main() async {
         _ = NSApplication.shared
@@ -630,6 +638,7 @@ private final class OfflineProtocol: URLProtocol {
             print("PASS: clearing all inputs persists separately from destination and protects pending saves")
             try await verifyBackgroundSend(root: root)
             try await verifyHistoryRetries(root: root)
+            try await verifyHistoryLimit(root: root)
             try await verifyBookmarkThumbnails(root: root, png: png)
             print("PASS: app-level verification used isolated temporary data and offline transport")
         } catch { print("FAIL: \(error)"); exit(1) }
@@ -725,19 +734,77 @@ private final class OfflineProtocol: URLProtocol {
         let newest = try Self.state(root: location)
         try require(newest.recentSends.map(\.draft.title) == ["送信6", "送信5", "送信4", "送信3", "送信2"],
                     "History exceeded five entries or lost newest-first order on restart")
-        let settings = SettingsWindow(state: newest)
-        let tabs = settings.window?.contentView?.subviews.compactMap { $0 as? NSTabView }.first
-        try require(tabs?.tabViewItems.map(\.label).contains("直近5件") == true, "Settings lost the history tab")
+        try require(newest.historyLimit == 5, "History did not default to five records")
         print("PASS: history retry is scoped, deduplicated, restart-safe and keeps only the five newest sends")
+    }
+
+    @MainActor private static func verifyHistoryLimit(root: URL) async throws {
+        let domain = "NotionWriterVerify.History." + UUID().uuidString
+        let preferences = UserDefaults(suiteName: domain)!
+        defer { preferences.removePersistentDomain(forName: domain) }
+        let location = root.appendingPathComponent("history-limit")
+        let state = try Self.state(root: location, preferences: preferences)
+        let settings = SettingsWindow(state: state)
+        guard let tabs = settings.window?.contentView?.subviews.compactMap({ $0 as? NSTabView }).first,
+              let tab = tabs.tabViewItems.first(where: { $0.label == "履歴" }),
+              let scroll = tab.view as? NSScrollView,
+              let stack = scroll.documentView?.subviews.first as? NSStackView,
+              let menu = stack.arrangedSubviews.first as? NSPopUpButton else {
+            throw CheckFailure.failed("History retention menu is missing from the top of the history tab")
+        }
+
+        tabs.selectTabViewItem(tab)
+        try require(menu.itemTitles == ["5件まで保存", "10件まで保存", "20件まで保存", "50件まで保存", "100件まで保存"] &&
+                    menu.selectedItem?.tag == 5, "History retention menu has incorrect choices or default")
+        menu.selectItem(withTag: 100)
+        if let action = menu.action { NSApp.sendAction(action, to: menu.target, from: menu) }
+        try require(state.historyLimit == 100, "The retention menu did not update the app setting")
+
+        let time = Date()
+        let records: [SendRecord] = (1...100).reversed().map { index in
+            var draft = Draft()
+            draft.title = "既存の履歴\(index)"
+            return SendRecord(id: UUID(), destination: TestDestination.target, attemptedAt: time.addingTimeInterval(Double(index - 101)),
+                              draft: draft, result: .sent)
+        }
+        try state.store.write(records, name: SendRecord.filename)
+        let restarted = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(restarted.historyLimit == 100 && restarted.recentSends.count == 100,
+                    "The selected limit and the existing 100 records were not restored")
+        restarted.draft.title = "新しい送信"
+        OfflineProtocol.pageStatus = 200
+        await restarted.submit()
+        try require(restarted.recentSends.count == 100 && restarted.recentSends.first?.draft.title == "新しい送信" &&
+                    restarted.recentSends.last?.draft.title == "既存の履歴2", "The 100-entry cap did not retain the newest records")
+
+        let pendingDraft = Draft()
+        restarted.draft = pendingDraft
+        try restarted.setHistoryLimit(20)
+        let stored = try restarted.store.read([SendRecord].self, name: SendRecord.filename)
+        try require(stored?.count == 20 && stored?.last?.draft.title == "既存の履歴82" &&
+                    restarted.draft == pendingDraft, "Reducing the limit did not persist pruning or changed the editor draft")
+        let reduced = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(reduced.historyLimit == 20 && reduced.recentSends == stored, "The reduced history limit was lost on restart")
+        try reduced.setHistoryLimit(50)
+        let expanded = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
+        try require(expanded.historyLimit == 50 && expanded.recentSends == stored, "Increasing the limit restored deleted history")
+        print("PASS: history limit menu, restart, 100-entry cap and newest-first pruning")
     }
 
     @MainActor private static func verifyBookmarkThumbnails(root: URL, png: Data) async throws {
         let thumbnailURL = URL(string: "https://example.org/preview")!
         let bareURL = URL(string: "https://example.org/no-preview")!
         guard let jpeg = BookmarkPreview.jpegThumbnail(png) else { throw CheckFailure.failed("Bookmark thumbnail did not convert") }
-        let state = try Self.state(root: root.appendingPathComponent("thumbnail-send")) { url in
-            url == thumbnailURL ? BookmarkPreview(title: "記事のタイトル", summary: "記事の説明", thumbnail: jpeg) : nil
+        let location = root.appendingPathComponent("thumbnail-send")
+        let domain = "NotionWriterVerify.Bookmarks." + UUID().uuidString
+        let preferences = UserDefaults(suiteName: domain)!
+        defer { preferences.removePersistentDomain(forName: domain) }
+        let lookups = BookmarkLookups()
+        let preview: @Sendable (URL) async -> BookmarkPreview? = { url in
+            await lookups.record()
+            return url == thumbnailURL ? BookmarkPreview(title: "記事のタイトル", summary: "記事の説明", thumbnail: jpeg) : nil
         }
+        let state = try Self.state(root: location, preferences: preferences, preview: preview)
         let writer = WriterWindow(state: state)
         writer.toggleBody()
         try require(writer.bodyEditor.pasteMarkdown("リンクの前"), "Missing text to check block order")
@@ -780,6 +847,40 @@ private final class OfflineProtocol: URLProtocol {
         let fallbackBlocks = fallback?["children"] as? [[String: Any]] ?? []
         try require(state.draft.isEmpty && fallbackBlocks.compactMap(PagePayload.bookmarkURL(in:)) == [thumbnailURL, bareURL, thumbnailURL],
                     "An optional thumbnail upload blocked page creation or lost the bookmark")
-        print("PASS: ordered bookmark callouts carry uploaded thumbnails, titles and original link targets with a bookmark fallback")
+        let settings = SettingsWindow(state: state)
+        guard let tabs = settings.window?.contentView?.subviews.compactMap({ $0 as? NSTabView }).first,
+              let general = tabs.tabViewItems.first(where: { $0.label == "一般" }),
+              let stack = general.view?.subviews.first as? NSStackView,
+              let menu = stack.arrangedSubviews.compactMap({ $0 as? NSPopUpButton }).first else {
+            throw CheckFailure.failed("General settings are missing the bookmark menu")
+        }
+        try require(menu.itemTitles == ["URLだけ貼る", "サムネイル付きカード"] &&
+                    menu.titleOfSelectedItem == "サムネイル付きカード", "Bookmark choices or the default are incorrect")
+        menu.selectItem(withTitle: "URLだけ貼る")
+        if let action = menu.action { NSApp.sendAction(action, to: menu.target, from: menu) }
+        let restarted = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!, preview: preview)
+        try require(restarted.bookmarkMode == .urlOnly, "Bookmark setting was not restored")
+
+        let previousLookups = await lookups.count
+        let previousUploads = OfflineProtocol.uploadCount
+        restarted.draft = draft
+        await restarted.submit()
+        let plain = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+        let plainBlocks = plain?["children"] as? [[String: Any]] ?? []
+        let outgoingURLs = plainBlocks.dropFirst().compactMap { block -> String? in
+            let paragraph = block["paragraph"] as? [String: Any]
+            let runs = paragraph?["rich_text"] as? [[String: Any]]
+            guard runs?.count == 1, let value = runs?.first?["text"] as? [String: Any],
+                  let content = value["content"] as? String, (value["link"] as? [String: String])?["url"] == content else {
+                return nil
+            }
+            return content
+        }
+        let currentLookups = await lookups.count
+        try require(restarted.draft.isEmpty && plainBlocks.allSatisfy { $0["type"] as? String == "paragraph" } &&
+                    outgoingURLs == [thumbnailURL, bareURL, thumbnailURL].map(\.absoluteString) &&
+                    previousLookups == currentLookups && previousUploads == OfflineProtocol.uploadCount,
+                    "URL-only delivery looked up previews, uploaded thumbnails, or lost the original links")
+        print("PASS: bookmark menu persists URL-only and thumbnail-card sends, keeping order and links")
     }
 }

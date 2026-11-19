@@ -3,7 +3,8 @@ import NotionWriterCore
 
 struct SendRecord: Codable, Equatable, Identifiable {
     static let filename = "send-history"
-    static let limit = 5
+    static let defaultLimit = 5
+    static let limits = [5, 10, 20, 50, 100]
 
     enum Result: String, Codable {
         case failed, uncertain, sent
