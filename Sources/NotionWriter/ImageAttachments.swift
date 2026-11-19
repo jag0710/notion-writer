@@ -5,6 +5,7 @@ import NotionWriterCore
 
 // Copies are owned by the draft, so moving a Finder original never breaks a pending note.
 enum ImageAttachments {
+    static let freePlanWarningBytes = 5_000_000
     static let maximumBytes = 20 * 1024 * 1024
     static func directory(_ root: URL) throws -> URL {
         let url = root.appendingPathComponent("attachments", isDirectory: true)

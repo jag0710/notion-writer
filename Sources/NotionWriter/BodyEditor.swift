@@ -6,6 +6,7 @@ final class BodyEditor: WriterTextView {
     private let commands = BodyCommandMenu()
     private var applyingFormat = false
     private var searchingCommands = false
+    var importWebContent: ((WebClip.Source, NSRange) -> Void)?
 
     var normalAttributes: [NSAttributedString.Key: Any] {
         [.font: baseFont, .foregroundColor: WriterStyle.ink, .paragraphStyle: NSParagraphStyle.default]
@@ -39,9 +40,93 @@ final class BodyEditor: WriterTextView {
 
     override func paste(_ sender: Any?) {
         guard isEditable else { return }
-        if ImageTransfer.accept(.general, files: importImageFiles, data: importImageData) { return }
-        if let source = NSPasteboard.general.string(forType: .string), pasteMarkdown(source) { return }
+        let pasteboard = NSPasteboard.general
+        if ImageTransfer.accept(pasteboard, files: importImageFiles, data: importImageData) { return }
+        let source = pasteboard.string(forType: .string) ?? pasteboard.string(forType: .URL)
+        if let source, pasteWebURL(source) { return }
+        if canPasteWebContent, let html = pasteboard.string(forType: .html), let importWebContent {
+            let base = WebResource.url(pasteboard.string(forType: .URL))
+            dismissCommands()
+            importWebContent(.selection(html, base: base, fallback: source), selectedRange())
+            return
+        }
+        if let source, pasteMarkdown(source) { return }
         super.pasteAsPlainText(sender)
+    }
+
+    private var canPasteWebContent: Bool {
+        let block = currentBlockAttributes()
+        return !hasMarkedText() && block[.bodyKind] as? String != "code"
+            && (block[.paragraphStyle] as? NSParagraphStyle)?.textBlocks.isEmpty != false
+    }
+
+    @discardableResult
+    func pasteWebURL(_ source: String) -> Bool {
+        let range = selectedRange()
+        let text = string as NSString
+        let block = currentBlockAttributes()
+        guard canPasteWebContent,
+              text.rangeOfCharacter(from: .newlines, options: [], range: range).location == NSNotFound,
+              let url = PagePayload.bookmarkURL(source.trimmingCharacters(in: .whitespacesAndNewlines)) else { return false }
+
+        dismissCommands()
+        var attributes = normalAttributes.merging(block) { _, new in new }
+        attributes[.font] = activeFont
+        var linkAttributes = attributes
+        linkAttributes[.link] = url
+        let link = NSAttributedString(string: url.absoluteString, attributes: linkAttributes)
+        guard replace(range, with: link) else { return false }
+        typingAttributes = attributes
+
+        if window?.isKeyWindow == true {
+            let pasted = NSRange(location: range.location, length: link.length)
+            commands.showURLPaste(in: self) { [weak self] action in
+                switch action {
+                case .bookmark: self?.makeBookmark(url, replacing: pasted)
+                case .clipArticle: self?.importWebContent?(.article(url), pasted)
+                default: break
+                }
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    func makeBookmark(_ url: URL, replacing pasted: NSRange) -> Bool {
+        guard !hasMarkedText(), let storage = textStorage else { return false }
+        let text = storage.string as NSString
+        let end = NSMaxRange(pasted)
+        guard end <= text.length, text.substring(with: pasted) == url.absoluteString else { return false }
+
+        return insertWebBlocks(BodyBookmarkAttachment.fragment(url, font: baseFont), replacing: pasted)
+    }
+
+    @discardableResult
+    func insertWebBlocks(_ blocks: NSAttributedString, replacing pasted: NSRange) -> Bool {
+        guard !hasMarkedText(), let storage = textStorage, NSMaxRange(pasted) <= storage.length,
+              blocks.length > 0 else { return false }
+        dismissCommands()
+        let text = storage.string as NSString
+        let end = NSMaxRange(pasted)
+        var range = pasted
+        let fragment = NSMutableAttributedString()
+        if pasted.location > 0 && text.character(at: pasted.location - 1) != 10 {
+            let before = storage.attributes(at: pasted.location - 1, effectiveRange: nil)
+            fragment.append(NSAttributedString(string: "\n", attributes: before.filter { $0.key != .attachment }))
+        }
+        fragment.append(blocks)
+        if end < text.length, text.character(at: end) == 10 { range.length += 1 }
+        guard replace(range, with: fragment) else { return false }
+        typingAttributes = normalAttributes
+        refreshBookmarkPreviews()
+        return true
+    }
+
+    func refreshBookmarkPreviews() {
+        guard let storage = textStorage else { return }
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+            (value as? BodyBookmarkAttachment)?.loadPreview(in: self)
+        }
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -138,7 +223,9 @@ final class BodyEditor: WriterTextView {
             default: break
             }
         }
-        if [36, 48, 53, 76, 123, 124, 125, 126].contains(event.keyCode) { dismissCommands() }
+        if commands.isVisible && !searchingCommands || [36, 48, 53, 76, 123, 124, 125, 126].contains(event.keyCode) {
+            dismissCommands()
+        }
         super.keyDown(with: event)
     }
 
@@ -155,7 +242,7 @@ final class BodyEditor: WriterTextView {
             let point = convert(event.locationInWindow, from: nil)
             let caret = characterIndexForInsertion(at: point)
             for index in [caret, caret - 1] where index >= 0 && index < storage.length {
-                guard storage.attribute(.attachment, at: index, effectiveRange: nil) is BodyImageAttachment,
+                guard hasStandaloneAttachment(at: index, in: storage),
                       let textContainer else { continue }
                 let range = NSRange(location: index, length: 1)
                 let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -172,7 +259,7 @@ final class BodyEditor: WriterTextView {
     }
 
     override func deleteBackward(_ sender: Any?) {
-        if let selection = imageDeletionRange() {
+        if let selection = attachmentDeletionRange() {
             replace(selection, with: NSAttributedString())
             typingAttributes = normalAttributes
             return
@@ -182,21 +269,26 @@ final class BodyEditor: WriterTextView {
     }
 
     override func deleteForward(_ sender: Any?) {
-        if selectedRange().length > 0, let selection = imageDeletionRange() {
+        if selectedRange().length > 0, let selection = attachmentDeletionRange() {
             replace(selection, with: NSAttributedString())
             typingAttributes = normalAttributes
         } else { super.deleteForward(sender) }
     }
 
-    private func imageDeletionRange() -> NSRange? {
+    private func attachmentDeletionRange() -> NSRange? {
         guard !hasMarkedText(), let storage = textStorage else { return nil }
         let selection = selectedRange()
         let text = storage.string as NSString
         let position = selection.length == 1 ? selection.location : selection.location - 2
         guard selection.length <= 1, position >= 0, position + 1 < storage.length,
-              storage.attribute(.attachment, at: position, effectiveRange: nil) is BodyImageAttachment,
+              hasStandaloneAttachment(at: position, in: storage),
               text.character(at: position + 1) == 10 else { return nil }
         return NSRange(location: position, length: 2)
+    }
+
+    private func hasStandaloneAttachment(at position: Int, in storage: NSAttributedString) -> Bool {
+        let attachment = storage.attribute(.attachment, at: position, effectiveRange: nil)
+        return attachment is BodyImageAttachment || attachment is BodyBookmarkAttachment
     }
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
@@ -381,6 +473,7 @@ final class BodyEditor: WriterTextView {
             switch action {
             case .block(let kind): self?.apply(kind, replacing: range)
             case .color(let color): self?.applyColor(color, replacing: range)
+            case .bookmark, .keepURL, .clipArticle: break
             }
         }
     }

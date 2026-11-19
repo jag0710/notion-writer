@@ -4,6 +4,9 @@ final class BodyCommandMenu: NSObject {
     enum Action: Equatable {
         case block(String)
         case color(String)
+        case bookmark
+        case keepURL
+        case clipArticle
     }
 
     private struct Command {
@@ -58,6 +61,18 @@ final class BodyCommandMenu: NSObject {
         let results = Array(available.filter {
             query.isEmpty || ($0.title + " " + $0.keywords).localizedStandardContains(query)
         }.prefix(12))
+        show(results, in: editor, onChoose: onChoose)
+    }
+
+    func showURLPaste(in editor: NSTextView, onChoose: @escaping (Action) -> Void) {
+        show([
+            Command(title: "ブックマークを作成", action: .bookmark, keywords: ""),
+            Command(title: "URLのまま", action: .keepURL, keywords: ""),
+            Command(title: "記事を取り込む", action: .clipArticle, keywords: ""),
+        ], in: editor, onChoose: onChoose)
+    }
+
+    private func show(_ results: [Command], in editor: NSTextView, onChoose: @escaping (Action) -> Void) {
         guard !results.isEmpty, let window = editor.window else { close(); return }
         self.onChoose = onChoose
         if !isVisible || matches.map(\.action) != results.map(\.action) {

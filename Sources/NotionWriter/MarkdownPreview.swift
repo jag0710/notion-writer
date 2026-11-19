@@ -43,6 +43,11 @@ enum MarkdownPreview {
                 listNumber = 0
                 continue
             }
+            if let url = PagePayload.bookmarkURL(in: block) {
+                result.append(BodyBookmarkAttachment.fragment(url, font: font))
+                listNumber = 0
+                continue
+            }
             guard let type = block["type"] as? String, let content = block[type] as? [String: Any] else { continue }
             if type == "numbered_list_item" { listNumber += 1 } else { listNumber = 0 }
             if type == "table" {
@@ -75,7 +80,7 @@ enum MarkdownPreview {
             }
             line.append(NSAttributedString(string: prefix, attributes: [.font: blockFont, .foregroundColor: WriterStyle.muted]))
             let runs = content["rich_text"] as? [[String: Any]] ?? []
-            line.append(renderRuns(runs, font: blockFont))
+            line.append(renderRuns(runs, font: blockFont, softLineBreaks: type != "code"))
             line.append(NSAttributedString(string: "\n", attributes: [.font: blockFont]))
             let range = NSRange(location: 0, length: line.length)
             line.addAttribute(.paragraphStyle, value: style, range: range)
@@ -93,7 +98,7 @@ enum MarkdownPreview {
         return result
     }
 
-    static func renderRuns(_ runs: [[String: Any]], font: NSFont) -> NSAttributedString {
+    static func renderRuns(_ runs: [[String: Any]], font: NSFont, softLineBreaks: Bool = false) -> NSAttributedString {
         let result = NSMutableAttributedString()
         for run in runs {
             guard let text = run["text"] as? [String: Any], let content = text["content"] as? String else { continue }
@@ -109,7 +114,9 @@ enum MarkdownPreview {
             if let link = (text["link"] as? [String: String])?["url"], let url = URL(string: link) {
                 attributes[.link] = url
             }
-            result.append(NSAttributedString(string: content, attributes: attributes))
+            // Keep explicit line breaks inside a single AppKit paragraph and Notion block.
+            let visible = softLineBreaks ? content.replacingOccurrences(of: "\n", with: "\u{2028}") : content
+            result.append(NSAttributedString(string: visible, attributes: attributes))
         }
         return result
     }

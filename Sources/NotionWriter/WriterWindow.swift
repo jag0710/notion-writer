@@ -36,14 +36,29 @@ class WriterTextView: NSTextView {
 }
 final class WriterPanel: NSPanel {
     var save: (() -> Void)?
+    var clearShortcut: (() -> Shortcut)?
+    var clear: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    func performClearShortcut(_ event: NSEvent, responder: NSResponder?) -> Bool {
+        guard clearShortcut?().matches(event) == true else { return false }
+        if !event.isARepeat, (responder as? NSTextView)?.hasMarkedText() != true { clear?() }
+        return true
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.keyCode == 36 && event.modifierFlags.intersection([.command,.option,.shift,.control]) == .command {
-            if let text = firstResponder as? NSTextView, text.hasMarkedText() { return true }
-            save?(); return true
+        if performClearShortcut(event, responder: firstResponder) { return true }
+        if Shortcut.send.matches(event) {
+            if (firstResponder as? NSTextView)?.hasMarkedText() != true { save?() }
+            return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, performClearShortcut(event, responder: firstResponder) { return }
+        super.sendEvent(event)
     }
 }
 @MainActor final class WriterWindow: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSTextFieldDelegate {
@@ -52,6 +67,9 @@ final class WriterPanel: NSPanel {
     let bodyEditor = BodyEditor()
     let properties = stack(.vertical, spacing: 0)
     let status = label("", size: 11, color: .secondaryLabelColor)
+    private let destinationLabel = label("", size: 11, color: .secondaryLabelColor)
+    private let sendButton = NSButton(title: "送信", target: nil, action: nil)
+    private let clearButton = NSButton(title: "入力をクリア", target: nil, action: nil)
     let pendingButton = NSButton(title: "保存結果を確認…", target: nil, action: nil)
     let bodyButton = QuietButton(title: "▸ 本文を追加", target: nil, action: nil)
     let bodyScroll = NSScrollView()
@@ -67,6 +85,13 @@ final class WriterPanel: NSPanel {
     private var bodyLoadError: String?
     let imageButton = QuietButton(title: "画像を追加…", target: nil, action: nil)
     let imageCount = label("", size: 11, color: .secondaryLabelColor)
+    private let imageSizeWarning = label("5MB以上の画像が含まれています", size: 11,
+                                         color: NSColor(srgbRed: 0.56, green: 0.31, blue: 0.08, alpha: 1))
+    private let thumbnailScroll = NSScrollView()
+    private let thumbnailStrip = NSView()
+    private var thumbnailHeight: NSLayoutConstraint!
+    private var thumbnailIDs: [String] = []
+    private var thumbnailScale: CGFloat = 0
     var tagRows: [TagRow] = []
     var urlFields: [NSTextField] = []
     var renderedSchema: Schema?
@@ -90,6 +115,8 @@ final class WriterPanel: NSPanel {
         panel.minSize = NSSize(width: preferredWidth, height: 260)
         super.init(window: panel); panel.delegate = self
         panel.save = { [weak self] in self?.submit() }
+        panel.clearShortcut = { state.clearShortcut }
+        panel.clear = { [weak self] in self?.clearInput() }
         let root = scaledStack(stack(.vertical, spacing: 10)); rootStack = root; root.translatesAutoresizingMaskIntoConstraints = false
         let content = WriterCardView(); content.importFiles = { [weak self] urls in self?.importImages(urls) }
         content.importData = { [weak self] data in self?.importImageData(data) }; content.wantsLayer = true; content.layer?.backgroundColor = NSColor.white.cgColor; content.layer?.cornerRadius = 14; content.layer?.borderWidth = 1; content.layer?.borderColor = NSColor(white: 0.9, alpha: 1).cgColor; content.layer?.masksToBounds = true; panel.contentView = content; content.addSubview(root)
@@ -114,6 +141,7 @@ final class WriterPanel: NSPanel {
         imageButton.imagePosition = .imageLeading; imageButton.imageHugsTitle = true; imageButton.setAccessibilityLabel("画像を追加")
         actions.addArrangedSubview(imageButton); actions.addArrangedSubview(imageCount)
         imageCount.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        actions.addArrangedSubview(imageSizeWarning)
         root.addArrangedSubview(actions); actions.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         configureEditor(bodyEditor)
         bodyEditor.drawsBackground = false
@@ -125,6 +153,7 @@ final class WriterPanel: NSPanel {
             guard let self else { return }
             importImageData(data, at: NSMaxRange(bodyEditor.selectedRange()))
         }
+        bodyEditor.importWebContent = { [weak self] source, range in self?.importWebContent(source, replacing: range) }
         bodyEditor.placeholder = "本文を入力…"
         bodyEditor.setAccessibilityLabel("本文")
         bodyEditor.allowsUndo = true
@@ -140,12 +169,45 @@ final class WriterPanel: NSPanel {
         bodyScroll.isHidden = !bodyExpanded
         root.addArrangedSubview(bodyScroll)
         bodyScroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
-        let footer = scaledStack(stack(.horizontal, spacing: 10))
-        status.maximumNumberOfLines = 3; status.lineBreakMode = .byWordWrapping; status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        footer.addArrangedSubview(status)
-        pendingButton.target = self; pendingButton.action = #selector(resolvePending); pendingButton.bezelStyle = .rounded; footer.addArrangedSubview(pendingButton)
+        thumbnailScroll.borderType = .noBorder
+        thumbnailScroll.drawsBackground = false
+        thumbnailScroll.hasHorizontalScroller = true
+        thumbnailScroll.scrollerStyle = .overlay
+        thumbnailScroll.autohidesScrollers = true
+        thumbnailScroll.documentView = thumbnailStrip
+        thumbnailScroll.setAccessibilityLabel("本文の画像（挿入順）")
+        thumbnailHeight = scaledConstraint(thumbnailScroll.heightAnchor.constraint(equalToConstant: 46))
+        thumbnailHeight.isActive = true
+        root.addArrangedSubview(thumbnailScroll)
+        thumbnailScroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        root.addArrangedSubview(footer); footer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        status.maximumNumberOfLines = 3
+        status.lineBreakMode = .byWordWrapping
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        root.addArrangedSubview(status)
+        status.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let footer = scaledStack(stack(.horizontal, spacing: 10))
+        footer.distribution = .fill
+        destinationLabel.lineBreakMode = .byTruncatingTail
+        footer.addArrangedSubview(destinationLabel)
+        sendButton.target = self
+        sendButton.action = #selector(saveClicked)
+        sendButton.bezelStyle = .rounded
+        footer.addArrangedSubview(sendButton)
+        pendingButton.target = self
+        pendingButton.action = #selector(resolvePending)
+        pendingButton.bezelStyle = .rounded
+        footer.addArrangedSubview(pendingButton)
+        let footerSpace = NSView()
+        footerSpace.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        footer.addArrangedSubview(footerSpace)
+        clearButton.target = self
+        clearButton.action = #selector(clearInput)
+        clearButton.bezelStyle = .rounded
+        footer.addArrangedSubview(clearButton)
+        root.addArrangedSubview(footer)
+        footer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         panel.contentMinSize = NSSize(width: preferredWidth, height: 260); panel.setContentSize(NSSize(width: preferredWidth,height: 480)); panel.initialFirstResponder = titleEditor; update(); panel.setContentSize(NSSize(width: preferredWidth, height: 480)); fitContent(); panel.center()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -172,7 +234,9 @@ final class WriterPanel: NSPanel {
         window.isMovableByWindowBackground = !state.display.fixedPosition
         for editor in [titleEditor, bodyEditor] { editor.textContainerInset = NSSize(width: 0, height: 3 * scale) }
         imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12 * scale, weight: .regular))
-        status.font = state.display.scaledFont(size: 11); imageCount.font = status.font
+        let footerFont = state.display.scaledFont(size: 11)
+        for field in [status, destinationLabel, imageCount, imageSizeWarning] { field.font = footerFont }
+        for button in [sendButton, pendingButton, clearButton] { button.font = footerFont }
         fittingContent = false
     }
     private func positionAtFixedLocation(on screen: NSScreen? = nil) {
@@ -230,6 +294,7 @@ final class WriterPanel: NSPanel {
             state.draft.title = titleEditor.string
             state.edited()
             titleEditor.needsDisplay = true
+            updateFooterActions()
             fitContent()
         } else {
             syncBodyDraft()
@@ -238,7 +303,9 @@ final class WriterPanel: NSPanel {
     }
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField, let id = field.identifier?.rawValue else { return }
-        state.draft.urls[id] = field.stringValue; state.edited()
+        state.draft.urls[id] = field.stringValue
+        state.edited()
+        updateFooterActions()
     }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         guard !textView.hasMarkedText(), let field = control as? NSTextField, let index = urlFields.firstIndex(of: field) else { return false }
@@ -269,15 +336,19 @@ final class WriterPanel: NSPanel {
         }
         loadBodyDraft()
         updateEditorAvailability()
-        let quiet = bodyLoadError == nil && ((state.activeDestination.map { state.status.hasPrefix($0.name + " · ") } ?? false) || state.status == "プロパティを同期中…" || state.status == "Notionに保存しました" || state.status == "保存結果を確認しました" || state.status.hasPrefix("画像を"))
-        let message = bodyLoadError ?? state.status
-        status.stringValue = message; status.toolTip = message
         let destination = state.activeDestination?.name
-        if quiet, let destination { status.stringValue = destination }
-        status.isHidden = destination == nil && quiet && !state.busy && !state.draft.submissionPending
-        status.superview?.isHidden = status.isHidden && !state.draft.submissionPending
-        updateImageCount()
+        let quiet = bodyLoadError == nil && ((destination.map { state.status.hasPrefix($0 + " · ") } ?? false) ||
+            ["プロパティを同期中…", "Notionに保存しました", "保存結果を確認しました",
+             "入力をクリアしました", "未接続 · サンプルタグを表示中 · 下書きはローカル保存"].contains(state.status) ||
+            state.status.hasSuffix("枚追加しました"))
+        let message = bodyLoadError ?? state.status
+        destinationLabel.stringValue = destination ?? "Notion未接続"
+        destinationLabel.toolTip = destination
+        status.stringValue = message
+        status.toolTip = message
+        status.isHidden = quiet
         pendingButton.isHidden = !state.draft.submissionPending
+        updateFooterActions()
         let schema = state.visibleSchema
         if renderedSchema?.properties != schema.properties || renderedSchema?.dataSourceID != schema.dataSourceID || renderedDisplay?.overallPercent != state.display.overallPercent {
             rebuildProperties(schema); renderedSchema = schema
@@ -313,6 +384,13 @@ final class WriterPanel: NSPanel {
         titleEditor.isEditable = !state.busy && !state.draft.submissionPending && !state.changingDestination
         bodyEditor.isEditable = titleEditor.isEditable && !state.importingImages && bodyLoadError == nil
         imageButton.isEnabled = bodyEditor.isEditable
+    }
+
+    private func updateFooterActions() {
+        let editable = !state.busy && !state.importingImages && !state.changingDestination && !state.draft.submissionPending
+        sendButton.isEnabled = editable && bodyLoadError == nil && state.connection != nil &&
+            !state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        clearButton.isEnabled = state.canClearDraft
     }
 
     func windowDidResize(_ notification: Notification) { fitContent() }
@@ -367,12 +445,17 @@ final class WriterPanel: NSPanel {
             row.saveRequested = { [weak self] in self?.submit() }
             row.activated = { [weak self] in self?.focusProperty(index) }
             row.layoutChanged = { [weak self] in self?.fitContent() }
-            row.changed = { [weak self] values in guard let self else { return }; self.state.draft.tags[property.id] = values; self.state.edited() }
+            row.changed = { [weak self] values in
+                guard let self else { return }
+                state.draft.tags[property.id] = values
+                state.edited()
+                updateFooterActions()
+            }
             row.move = { [weak self] back in self?.focusProperty(index + (back ? -1 : 1)) }
             properties.addArrangedSubview(row); row.widthAnchor.constraint(equalTo: properties.widthAnchor).isActive = true; tagRows.append(row)
         }
         for property in schema.urls {
-            let row = stack(.horizontal, spacing: 10 * state.display.scale)
+            let row = stack(.horizontal, spacing: 2 * state.display.scale)
             let icon = NSImageView(); icon.image = NSImage(systemSymbolName: "link", accessibilityDescription: nil); icon.contentTintColor = WriterStyle.muted
             icon.widthAnchor.constraint(equalToConstant: 16 * state.display.scale).isActive = true; icon.heightAnchor.constraint(equalToConstant: 18 * state.display.scale).isActive = true
             let field = NSTextField(); field.placeholderString = property.name + "を追加"; field.stringValue = state.draft.urls[property.id] ?? ""
@@ -380,7 +463,7 @@ final class WriterPanel: NSPanel {
             field.font = state.display.scaledFont(size: state.display.propertySize); field.identifier = .init(property.id); field.delegate = self
             row.addArrangedSubview(icon); row.addArrangedSubview(field); row.heightAnchor.constraint(greaterThanOrEqualToConstant: max(26, CGFloat(state.display.propertySize + 10)) * state.display.scale).isActive = true
             properties.addArrangedSubview(row); row.widthAnchor.constraint(equalTo: properties.widthAnchor).isActive = true
-            field.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -26 * state.display.scale).isActive = true; urlFields.append(field)
+            field.trailingAnchor.constraint(equalTo: row.trailingAnchor).isActive = true; urlFields.append(field)
         }
     }
     @objc func addImages() {
@@ -411,6 +494,31 @@ final class WriterPanel: NSPanel {
         Task { await state.addImageData(data) { try insertImages($0, at: caret) } }
     }
 
+    private func importWebContent(_ source: WebClip.Source, replacing range: NSRange) {
+        guard bodyEditor.isEditable, !bodyEditor.hasMarkedText() else { return }
+        let previousBody = bodyEditor.string
+        Task {
+            await state.addWebContent(source) { content in
+                guard bodyEditor.string == previousBody else {
+                    throw WriterError.validation("本文が変わりました。もう一度貼り付けてください。")
+                }
+                let byID = Dictionary(uniqueKeysWithValues: content.images.map { ($0.id, $0) })
+                let fragment = MarkdownPreview.render(content.blocks, font: bodyEditor.baseFont) { [self] id in
+                    byID[id].map { bodyEditor.imageFragment($0, root: state.store.root, size: imagePreviewSize) }
+                }
+                bodyEditor.isEditable = true
+                guard bodyEditor.insertWebBlocks(fragment, replacing: range) else {
+                    throw WriterError.validation("取り込んだ内容を本文に挿入できませんでした。")
+                }
+                if let title = content.title, state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    state.draft.title = title
+                    titleEditor.string = title
+                }
+                fitContent()
+            }
+        }
+    }
+
     private var imagePreviewSize: NSSize {
         let scale = state.display.scale
         let width = (window?.contentView?.bounds.width ?? preferredWidth) - 60 * scale
@@ -422,10 +530,7 @@ final class WriterPanel: NSPanel {
         guard bodyEditor.insertImages(images, at: caret, root: state.store.root, size: imagePreviewSize) else {
             throw WriterError.validation("画像を本文に挿入できませんでした。")
         }
-        if window?.isVisible == true {
-            bodyExpanded = true
-            updateBodyPresentation()
-            fitContent()
+        if bodyExpanded, window?.isKeyWindow == true {
             window?.makeFirstResponder(bodyEditor)
             bodyEditor.scrollRangeToVisible(bodyEditor.selectedRange())
         }
@@ -470,6 +575,7 @@ final class WriterPanel: NSPanel {
             bodyLoadError = "本文を復元できませんでした。下書きを保護するため、本文の編集と送信を止めました。"
         }
         bodyEditor.textStorage?.setAttributedString(attributed)
+        bodyEditor.refreshBookmarkPreviews()
         let offset = min(previousSelection.location, attributed.length)
         bodyEditor.setSelectedRange(NSRange(location: offset, length: min(previousSelection.length, attributed.length - offset)))
         bodyEditor.typingAttributes = bodyEditor.normalAttributes
@@ -499,14 +605,50 @@ final class WriterPanel: NSPanel {
         loadedBlocks = encoded
         loadedFormat = .markdown
         loadedImages = images.map(\.id)
-        updateImageCount()
+        updateBodyPresentation()
+        updateFooterActions()
         state.edited()
     }
-    private func updateImageCount() {
-        imageCount.stringValue = state.importingImages ? "追加中…" : (state.draft.images.isEmpty ? "" : "画像\(state.draft.images.count)枚")
+
+    private func updateThumbnails() {
+        let images = state.draft.images
+        thumbnailScroll.isHidden = bodyExpanded || images.isEmpty
+        guard !thumbnailScroll.isHidden else {
+            if images.isEmpty { thumbnailStrip.subviews = []; thumbnailIDs = [] }
+            return
+        }
+        let ids = images.map(\.id)
+        let scale = state.display.scale
+        guard ids != thumbnailIDs || scale != thumbnailScale else { return }
+        thumbnailIDs = ids
+        thumbnailScale = scale
+        let height = 46 * scale
+        let width = 62 * scale
+        let gap = 7 * scale
+        let views = images.enumerated().map { index, image in
+            let view = NSImageView(frame: NSRect(x: CGFloat(index) * (width + gap), y: 0, width: width, height: height))
+            view.image = ImageAttachments.thumbnail(image, root: state.store.root, maximumPixels: 180) ??
+                NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
+            view.imageScaling = .scaleProportionallyUpOrDown
+            view.wantsLayer = true
+            view.layer?.cornerRadius = 5 * scale
+            view.layer?.backgroundColor = WriterStyle.hover.cgColor
+            view.layer?.masksToBounds = true
+            view.setAccessibilityLabel("\(index + 1)枚目 " + image.name)
+            view.toolTip = image.name
+            return view
+        }
+        thumbnailStrip.subviews = views
+        thumbnailStrip.setFrameSize(NSSize(width: CGFloat(views.count) * (width + gap) - gap, height: height))
+        thumbnailScroll.reflectScrolledClipView(thumbnailScroll.contentView)
     }
+
     private func updateBodyPresentation() {
         bodyScroll.isHidden = !bodyExpanded
+        let images = state.draft.images
+        imageCount.stringValue = images.isEmpty ? "" : "画像\(images.count)枚"
+        imageSizeWarning.isHidden = !images.contains { $0.byteCount >= ImageAttachments.freePlanWarningBytes }
+        updateThumbnails()
         if bodyExpanded { bodyButton.title = "▾ 本文" }
         else { bodyButton.title = state.draft.body.isEmpty && state.draft.images.isEmpty ? "▸ 本文を追加" : "▸ 本文" }
     }
@@ -518,6 +660,17 @@ final class WriterPanel: NSPanel {
             window?.makeFirstResponder(titleEditor)
             if state.display.fixedPosition { positionAtFixedLocation() }
         }
+    }
+    @objc private func clearInput() {
+        guard state.canClearDraft else { return }
+        if (window?.firstResponder as? NSTextView)?.hasMarkedText() == true { return }
+        tagRows.forEach { $0.collapse() }
+        window?.makeFirstResponder(titleEditor)
+        do {
+            try state.clearDraft()
+            update()
+            resetAfterSave()
+        } catch { showError(error) }
     }
     @objc func saveClicked() { submit() }
     func submit() {

@@ -20,6 +20,10 @@ import NotionWriterCore
     private let clientOverride: (() throws -> NotionClient)?
     private var retryNotBefore = Date.distantPast
     var display = DisplayPreferences.load()
+    private(set) var clearShortcut = Shortcut.loadClear()
+    var canClearDraft: Bool {
+        !busy && !importingImages && !changingDestination && !draft.submissionPending && !draft.isEmpty
+    }
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
     init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil) throws {
@@ -53,6 +57,21 @@ import NotionWriterCore
     func flush() throws {
         pendingSave?.cancel(); pendingSave = nil
         try store.write(draft, name: store.draftName(for: connection))
+    }
+    func setClearShortcut(_ value: Shortcut) {
+        clearShortcut = value
+        value.saveClear()
+    }
+    func clearDraft() throws {
+        guard canClearDraft else { return }
+        let empty = Draft()
+        try store.write(empty, name: store.draftName(for: connection))
+        pendingSave?.cancel()
+        pendingSave = nil
+        draft = empty
+        draftRevision += 1
+        status = "入力をクリアしました"
+        updated?()
     }
     func opened() {
         guard connection != nil, schema?.needsRefresh() ?? true else { return }
@@ -220,6 +239,28 @@ import NotionWriterCore
             status = "画像を\(images.count)枚追加しました"
         } catch { status = error.localizedDescription }
     }
+    func addWebContent(_ source: WebClip.Source, insert: (WebClip.Prepared) throws -> Void) async {
+        guard !busy, !importingImages, !changingDestination, !draft.submissionPending else { return }
+        importingImages = true
+        status = "Webの内容を取り込み中…"
+        updated?()
+        defer { importingImages = false; updated?() }
+        do {
+            let root = store.root
+            let availableImages = 100 - draft.images.count
+            let content = try await Task.detached(priority: .userInitiated) {
+                try await WebClip.prepare(source, root: root, availableImages: availableImages)
+            }.value
+            guard !content.blocks.isEmpty else { throw WriterError.validation("貼り付ける本文がありません。") }
+            try insert(content)
+            try flush()
+            status = content.skippedImages == 0 ? "Webの内容を取り込みました"
+                : "Webの内容を取り込みました。取得できなかった画像\(content.skippedImages)枚はリンクで残しています。"
+        } catch {
+            status = "Webの内容を取り込めませんでした。 " + error.localizedDescription
+        }
+    }
+
     private func applyError(_ error: Error) {
         if case WriterError.api(_, _, let retry) = error, let retry { retryNotBefore = Date().addingTimeInterval(TimeInterval(max(0, retry))) }
         status = error.localizedDescription

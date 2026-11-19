@@ -20,7 +20,7 @@ public enum PagePayload {
     }
     private static let bodyBlockTypes: Set<String> = [
         "paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item",
-        "quote", "to_do", "code", "divider", "table", "draft_image"
+        "quote", "to_do", "code", "divider", "table", "bookmark", "draft_image"
     ]
 
     private static func validText(_ value: Any?) -> Bool {
@@ -36,6 +36,9 @@ public enum PagePayload {
         switch type {
         case "divider", "draft_image":
             return content["children"] == nil
+        case "bookmark":
+            return content["children"] == nil && bookmarkURL(in: block) != nil
+                && (content["caption"] == nil || validText(content["caption"]))
         case "table":
             guard let columns = content["table_width"] as? Int, columns > 0,
                   let rows = content["children"] as? [[String: Any]], !rows.isEmpty else { return false }
@@ -67,6 +70,25 @@ public enum PagePayload {
         let pieces = chunks(draft.body)
         return try pieces.map { text in ["object": "block", "type": "paragraph", "paragraph": ["rich_text": try richText(text)]] }
     }
+    public static func bookmarkURL(_ source: String) -> URL? {
+        guard source.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil,
+              let url = URL(string: source),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host, !host.isEmpty, url.absoluteString.utf16.count <= 2000 else { return nil }
+        return url
+    }
+
+    public static func bookmarkURL(in block: [String: Any]) -> URL? {
+        guard block["type"] as? String == "bookmark",
+              let content = block["bookmark"] as? [String: Any],
+              let source = content["url"] as? String else { return nil }
+        return bookmarkURL(source)
+    }
+
+    public static func bookmark(_ url: URL) -> [String: Any] {
+        ["object": "block", "type": "bookmark", "bookmark": ["url": url.absoluteString]]
+    }
+
     public static func imageReference(_ id: String) -> [String: Any] {
         ["type": "draft_image", "draft_image": ["id": id]]
     }

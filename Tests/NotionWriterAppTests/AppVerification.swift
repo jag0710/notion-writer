@@ -505,7 +505,109 @@ private final class OfflineProtocol: URLProtocol {
             try require(sharedState.draft.title == "本番用だけの下書き", "Switching back lost the main draft")
             OfflineProtocol.alternateDestination = nil
             print("PASS: read-only destination verification, cancellation and isolated destination switching")
-            print("PASS: 17 app-level scenarios (isolated temporary data; no Keychain or real Notion requests)")
+            let bookmarkRoot = root.appendingPathComponent("bookmarks", isDirectory: true)
+            let bookmarkState = try Self.state(root: bookmarkRoot)
+            let bookmarkWindow = WriterWindow(state: bookmarkState)
+            bookmarkWindow.toggleBody()
+            let bookmarkEditor = bookmarkWindow.bodyEditor
+            let article = "https://note.com/kenhori2/n/nb1856e88a60d"
+            let url = URL(string: article)!
+            try require(!bookmarkEditor.pasteWebURL("参考 " + article) && !bookmarkEditor.pasteWebURL("file:///tmp/test"),
+                        "Non-web text was handled as a bookmark URL")
+            try require(bookmarkEditor.pasteMarkdown("前の文章\n\n後ろの文章"), "Failed to prepare surrounding text")
+            let next = (bookmarkEditor.string as NSString).range(of: "後ろの文章").location
+            bookmarkEditor.setSelectedRange(NSRange(location: next, length: 0))
+            try require(bookmarkEditor.pasteWebURL(article), "A single web URL was not accepted")
+            let range = NSRange(location: next, length: (article as NSString).length)
+            let plain = try PagePayload.bodyBlocks(bookmarkState.draft)
+            try require(plain.allSatisfy { PagePayload.bookmarkURL(in: $0) == nil }, "Pasting created a bookmark without a choice")
+            try require(bookmarkEditor.makeBookmark(url, replacing: range), "Choosing a bookmark failed")
+            bookmarkState.draft.title = "ブックマーク"
+            try bookmarkState.flush()
+
+            let reopenedBookmarks = try Self.state(root: bookmarkRoot)
+            let restoredBookmarkWindow = WriterWindow(state: reopenedBookmarks)
+            restoredBookmarkWindow.toggleBody()
+            let restoredBookmarkEditor = restoredBookmarkWindow.bodyEditor
+            let restoredBlocks = BodyDocument.read(restoredBookmarkEditor.attributedString()).blocks
+            try require(restoredBlocks.compactMap { $0["type"] as? String } == ["paragraph", "bookmark", "paragraph"],
+                        "Restoring the bookmark reordered or changed the surrounding blocks")
+            try require(PagePayload.bookmarkURL(in: restoredBlocks[1]) == url, "The bookmark URL did not survive reopening")
+
+            OfflineProtocol.pageStatus = 200
+            await reopenedBookmarks.submit()
+            let savedPage = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+            let children = savedPage?["children"] as? [[String: Any]] ?? []
+            try require(children.count == 3 && PagePayload.bookmarkURL(in: children[1]) == url,
+                        "The create-page request lost the bookmark")
+
+            let attachment = (restoredBookmarkEditor.string as NSString).range(of: "\u{fffc}")
+            try require(attachment.location != NSNotFound, "The bookmark attachment was not rendered")
+            restoredBookmarkEditor.setSelectedRange(attachment)
+            restoredBookmarkEditor.deleteBackward(nil)
+            try require(BodyDocument.read(restoredBookmarkEditor.attributedString()).blocks.count == 2,
+                        "Deleting the bookmark removed surrounding text or left an empty block")
+            print("PASS: web URL choice, bookmark restore, Notion payload and deletion")
+            let clipRoot = root.appendingPathComponent("article", isDirectory: true)
+            let clipState = try Self.state(root: clipRoot)
+            let clipWindow = WriterWindow(state: clipState)
+            clipWindow.toggleBody()
+            let html = """
+            <article><h2>記事の見出し</h2><p>先頭 <strong>強調</strong><br><br><a href="/source">出典</a></p><p><br></p>
+              <figure><div class="external-article-widget"><a href="https://example.org/news">リンクカード</a></div></figure>
+              <figure><img src="/one.png" alt="写真"><figcaption>説明</figcaption></figure>
+              <p>後半</p><p><br></p><img src="/unavailable.png" alt="取得できない画像"><script>skip me</script></article>
+            """
+            let base = URL(string: "https://example.org/article")!
+            let content = try await WebClip.prepare(.selection(html, base: base, fallback: nil),
+                                                    root: clipRoot, availableImages: 100) { url in
+                if url.lastPathComponent == "unavailable.png" { throw URLError(.resourceUnavailable) }
+                return png
+            }
+            let clipEditor = clipWindow.bodyEditor
+            let fragment = MarkdownPreview.render(content.blocks, font: clipEditor.baseFont) { id in
+                content.images.first(where: { $0.id == id }).map {
+                    clipEditor.imageFragment($0, root: clipRoot, size: NSSize(width: 480, height: 300))
+                }
+            }
+            try require(content.images.count == 1 && content.skippedImages == 1, "Article images were lost or failures were hidden")
+            try require(clipEditor.insertWebBlocks(fragment, replacing: NSRange(location: 0, length: 0)), "Could not paste article")
+            let articleBlocks = try PagePayload.bodyWithImages(clipState.draft)
+            try require(articleBlocks.compactMap { $0["type"] as? String } == ["heading_2", "paragraph", "paragraph", "bookmark", "draft_image", "paragraph", "paragraph", "paragraph", "paragraph"],
+                        "Article paste lost the order or a supported block")
+            let articleJSON = String(decoding: try JSONSerialization.data(withJSONObject: articleBlocks, options: [.withoutEscapingSlashes]), as: UTF8.self)
+            try require(articleJSON.contains("https://example.org/source") && articleJSON.contains("https://example.org/unavailable.png")
+                        && articleJSON.contains("bold") && !articleJSON.contains("skip me"), "Article formatting or links were not preserved")
+            let paragraphRuns = (articleBlocks[1]["paragraph"] as? [String: Any])?["rich_text"] as? [[String: Any]] ?? []
+            let paragraph = paragraphRuns.compactMap { ($0["text"] as? [String: Any])?["content"] as? String }.joined()
+            let blank = (articleBlocks[2]["paragraph"] as? [String: Any])?["rich_text"] as? [[String: Any]]
+            try require(paragraph == "先頭 強調\n\n出典" && blank?.isEmpty == true,
+                        "Article line breaks were lost or converted to new paragraphs")
+            try clipState.flush()
+            let clipReopened = try Self.state(root: clipRoot)
+            let reopenedWindow = WriterWindow(state: clipReopened)
+            reopenedWindow.toggleBody()
+            try require(clipReopened.draft.images == content.images &&
+                        reopenedWindow.bodyEditor.string.contains("強調\u{2028}\u{2028}出典\n\n"),
+                        "Article images or line breaks did not survive reopening")
+            print("PASS: HTML article paste with ordered images, links, paragraphs and blank lines")
+
+            clipState.draft.title = "クリアのテスト"
+            clipState.draft.tags = ["tags": ["one"]]
+            clipState.draft.urls = ["url": "https://example.org"]
+            clipState.draft.submissionPending = true
+            try clipState.clearDraft()
+            try require(!clipState.draft.isEmpty, "Clearing discarded a pending submission")
+            clipState.draft.submissionPending = false
+            clipState.edited()
+            try clipState.clearDraft()
+            clipWindow.update()
+            try require(clipState.draft == Draft() && clipState.activeDestination == TestDestination.target &&
+                        clipWindow.titleEditor.string.isEmpty && clipWindow.bodyEditor.string.isEmpty,
+                        "Clear left editor content behind or changed the destination")
+            try require(try Self.state(root: clipRoot).draft == Draft(), "Cleared draft was restored on restart")
+            print("PASS: clearing all inputs persists separately from destination and protects pending saves")
+            print("PASS: 20 app-level scenarios (isolated temporary data; no Keychain or real Notion requests)")
         } catch { print("FAIL: \(error)"); exit(1) }
     }
 }

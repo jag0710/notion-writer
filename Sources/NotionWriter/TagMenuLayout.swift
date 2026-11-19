@@ -16,10 +16,16 @@ final class TagOptionsPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.keyCode == 36 && event.modifierFlags.intersection([.command, .option, .shift, .control]) == .command {
+        if (parent as? WriterPanel)?.performClearShortcut(event, responder: firstResponder) == true { return true }
+        if Shortcut.send.matches(event) {
             if let editor = firstResponder as? NSTextView, editor.hasMarkedText() { return true }
             saveRequested?(); return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           (parent as? WriterPanel)?.performClearShortcut(event, responder: firstResponder) == true { return }
+        super.sendEvent(event)
     }
 }

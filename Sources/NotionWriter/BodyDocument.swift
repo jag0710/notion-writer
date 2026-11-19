@@ -16,11 +16,17 @@ enum BodyDocument {
         }
 
         text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, range, _ in
-            guard let attachment = value as? BodyImageAttachment else { return }
-            appendText(until: range.location)
-            let image = attachment.draftImage
-            blocks.append(PagePayload.imageReference(image.id))
-            if ids.insert(image.id).inserted { images.append(image) }
+            if let attachment = value as? BodyImageAttachment {
+                appendText(until: range.location)
+                let image = attachment.draftImage
+                blocks.append(PagePayload.imageReference(image.id))
+                if ids.insert(image.id).inserted { images.append(image) }
+            } else if let attachment = value as? BodyBookmarkAttachment {
+                appendText(until: range.location)
+                blocks.append(PagePayload.bookmark(attachment.url))
+            } else {
+                return
+            }
             start = NSMaxRange(range)
             if start < source.length, source.character(at: start) == 10 { start += 1 }
         }
@@ -165,7 +171,7 @@ enum BodyDocument {
             if next != marks || nextLink != link { flush() }
             marks = next
             link = nextLink
-            buffered += (text.string as NSString).substring(with: range)
+            buffered += (text.string as NSString).substring(with: range).replacingOccurrences(of: "\u{2028}", with: "\n")
         }
         flush()
         return result

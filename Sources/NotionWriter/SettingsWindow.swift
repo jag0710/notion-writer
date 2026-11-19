@@ -192,16 +192,61 @@ import NotionWriterCore
         sizeSliders[id] = slider; sizeLabels[id] = value
     }
     private func buildGeneralTab(_ root: NSStackView) {
-        root.addArrangedSubview(label("呼び出しショートカット", size: 16))
-        let recorder = ShortcutRecorder()
-        recorder.changed = { [weak self] value in
+        root.addArrangedSubview(label("キーボードショートカット", size: 16))
+        let openRecorder = ShortcutRecorder(shortcut: .load())
+        let clearRecorder = ShortcutRecorder(shortcut: state.clearShortcut)
+        addShortcutRow("入力画面の呼び出し", detail: "他のアプリを使用中でも開けます。", recorder: openRecorder, to: root)
+        let divider = NSBox()
+        divider.boxType = .separator
+        root.addArrangedSubview(divider)
+        divider.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        addShortcutRow("入力をクリア", detail: "入力画面のタイトル、プロパティ、画像、本文を消去します。", recorder: clearRecorder, to: root)
+
+        openRecorder.validate = { [weak self] value in
+            if value == self?.state.clearShortcut { return "「入力をクリア」と異なるキーを選んでください。" }
+            if value == .send || (value.flags == .command && [UInt32(12), 13, 48].contains(value.keyCode)) {
+                return "アプリで使用中の操作と異なるキーを選んでください。"
+            }
+            return nil
+        }
+        clearRecorder.validate = { value in
+            if value == Shortcut.load() { return "「入力画面の呼び出し」と異なるキーを選んでください。" }
+            if value == .send || (value.flags == .command && [UInt32(0), 6, 7, 8, 9, 12, 13, 48, 43].contains(value.keyCode)) {
+                return "アプリで使用中の操作と異なるキーを選んでください。"
+            }
+            return nil
+        }
+        openRecorder.rejected = { [weak self] in self?.setShortcutMessage($0) }
+        clearRecorder.rejected = openRecorder.rejected
+        openRecorder.changed = { [weak self] value in
             guard let self else { return }
             self.setShortcutMessage(self.shortcutChanged?(value))
         }
-        root.addArrangedSubview(recorder)
-        shortcutMessage.maximumNumberOfLines = 4; shortcutMessage.isHidden = true; root.addArrangedSubview(shortcutMessage)
+        clearRecorder.changed = { [weak self] value in
+            self?.state.setClearShortcut(value)
+            self?.setShortcutMessage(nil)
+        }
+        shortcutMessage.maximumNumberOfLines = 4
+        shortcutMessage.isHidden = true
+        root.addArrangedSubview(shortcutMessage)
         shortcutMessage.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
+
+    private func addShortcutRow(_ title: String, detail: String, recorder: ShortcutRecorder, to root: NSStackView) {
+        let row = stack(.horizontal, spacing: 16)
+        let description = stack(.vertical, spacing: 4)
+        description.addArrangedSubview(label(title))
+        description.addArrangedSubview(label(detail, size: 11, color: .secondaryLabelColor))
+        let space = NSView()
+        row.addArrangedSubview(description)
+        row.addArrangedSubview(space)
+        row.addArrangedSubview(recorder)
+        recorder.setAccessibilityLabel(title + "のショートカット")
+        recorder.widthAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
+        root.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+    }
+
     func setShortcutMessage(_ warning: String?) {
         shortcutMessage.stringValue = warning ?? ""
         shortcutMessage.isHidden = warning == nil
