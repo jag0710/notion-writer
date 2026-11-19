@@ -4,12 +4,12 @@ cd "$(dirname "$0")/.."
 BUNDLE_ID="io.github.jag0710.notion-writer"
 APP_NAME="Notion Writer"
 DISPLAY_NAME="$APP_NAME"
-BUNDLE_VERSION="5"
+VERSION="1.2.0"
+BUNDLE_VERSION="9"
 if [[ $# -eq 1 && "$1" == --trial ]]; then
     BUNDLE_ID="$BUNDLE_ID.trial"
     APP_NAME="Notion Writer Trial"
     DISPLAY_NAME="Notion Writer 試験版"
-    BUNDLE_VERSION="8"
 elif [[ $# -ne 0 ]]; then
     printf 'Usage: %s [--trial]\n' "$0" >&2
     exit 2
@@ -45,7 +45,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>$DISPLAY_NAME</string>
 <key>CFBundleExecutable</key><string>NotionWriter</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.1</string>
+<key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>CFBundleVersion</key><string>$BUNDLE_VERSION</string>
 <key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
