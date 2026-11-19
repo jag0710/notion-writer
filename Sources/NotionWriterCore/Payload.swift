@@ -35,17 +35,18 @@ public enum PagePayload {
               let content = block[type] as? [String: Any] else { return false }
         switch type {
         case "divider", "draft_image":
-            return true
+            return content["children"] == nil
         case "table":
             guard let columns = content["table_width"] as? Int, columns > 0,
                   let rows = content["children"] as? [[String: Any]], !rows.isEmpty else { return false }
             return rows.allSatisfy { row in
                 guard row["type"] as? String == "table_row",
-                      let cells = (row["table_row"] as? [String: Any])?["cells"] as? [[[String: Any]]] else { return false }
+                      let rowContent = row["table_row"] as? [String: Any], rowContent["children"] == nil,
+                      let cells = rowContent["cells"] as? [[[String: Any]]] else { return false }
                 return cells.count == columns && cells.allSatisfy { validText($0) }
             }
         default:
-            return validText(content["rich_text"])
+            return content["children"] == nil && validText(content["rich_text"])
         }
     }
 

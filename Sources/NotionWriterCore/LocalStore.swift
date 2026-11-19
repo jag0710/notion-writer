@@ -1,10 +1,31 @@
 import Foundation
+import Darwin
 
 public final class LocalStore {
     public let root: URL
-    public init(root: URL) throws {
+    private var lockFD: Int32?
+
+    public init(root: URL, exclusive: Bool = false) throws {
         self.root = root
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if exclusive {
+            let lock = root.appendingPathComponent(".writer.lock")
+            let fd = Darwin.open(lock.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                let code = errno
+                Darwin.close(fd)
+                if code == EWOULDBLOCK {
+                    throw WriterError.validation("Notion Writerがすでにこの下書きフォルダを使用しています。")
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            }
+            lockFD = fd
+        }
+    }
+
+    deinit {
+        if let lockFD { Darwin.close(lockFD) }
     }
     public func read<T: Decodable>(_ type: T.Type, name: String) throws -> T? {
         let url = root.appendingPathComponent(name + ".json")

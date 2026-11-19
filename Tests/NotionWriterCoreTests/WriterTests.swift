@@ -167,7 +167,7 @@ final class APITests: XCTestCase {
         XCTAssertEqual(requests, 0)
     }
     func testAmbiguousWriteIsNeverAutomaticallyRetried() async {
-        for status in [500, 503, 504] {
+        for status in [302, 400, 408, 409, 429, 500, 503, 504] {
             var count = 0
             MockProtocol.handler = { _ in count += 1; return (status, [:], Data()) }
             do { _ = try await client().createPage(payload: pageRequest(), destination: TestDestination.target); XCTFail("Must flag uncertain") }
@@ -179,7 +179,7 @@ final class APITests: XCTestCase {
         catch WriterError.uncertain {} catch { XCTFail("Wrong error") }
     }
     func testRateLimitExposesRetryAfter() async {
-        MockProtocol.handler = { _ in (429, ["Retry-After": "45"], Data(#"{"message":"rate limited"}"#.utf8)) }
+        MockProtocol.handler = { _ in (429, ["Retry-After": "45"], Data(#"{"object":"error","status":429,"code":"rate_limited","message":"rate limited"}"#.utf8)) }
         do { _ = try await client().createPage(payload: pageRequest(), destination: TestDestination.target); XCTFail("Must fail") }
         catch WriterError.api(let status, _, let retry) { XCTAssertEqual(status, 429); XCTAssertEqual(retry, 45) }
         catch { XCTFail("Wrong error") }
@@ -288,4 +288,25 @@ private func readBody(_ stream: InputStream?) -> Data {
     var data = Data(); var buffer = [UInt8](repeating: 0, count: 4096)
     while true { let count = stream.read(&buffer,maxLength: buffer.count); if count <= 0 { break }; data.append(buffer,count: count) }
     return data
+}
+
+extension WriterTests {
+    func testDraftLockBlocksASecondWriterUntilReleased() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let store = try LocalStore(root: root, exclusive: true)
+            try store.write(Draft(), name: "draft")
+            XCTAssertThrowsError(try LocalStore(root: root, exclusive: true))
+        }
+        let reopened = try LocalStore(root: root, exclusive: true)
+        XCTAssertEqual(try reopened.read(Draft.self, name: "draft"), Draft())
+    }
+
+    func testUnexpectedNestedBlockInDraftIsRejected() throws {
+        var draft = Draft()
+        draft.title = "Test"
+        draft.formattedBody = Data(#"[{"type":"paragraph","paragraph":{"rich_text":[],"children":[{"type":"child_database","child_database":{"title":"Unexpected"}}]}}]"#.utf8)
+        XCTAssertThrowsError(try PagePayload.prepare(draft: draft, schema: schema(), destination: TestDestination.target))
+    }
 }

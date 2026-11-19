@@ -40,13 +40,15 @@ func XCTUnwrap<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #lin
             writer.testCacheRefreshBoundary()
             try writer.testDraftRoundTripAndSourceIsolationAndCorruption()
             try await api.testMetadataSyncNeverQueriesCardsAndPreservesColors()
-        await api.testWrongCreateParentStopsBeforeNetwork()
+            await api.testWrongCreateParentStopsBeforeNetwork()
             await api.testWrongDatabaseStopsBeforeAnyFurtherRequest()
             await api.testAmbiguousWriteIsNeverAutomaticallyRetried()
             await api.testRateLimitExposesRetryAfter()
             await api.testMultipleSourcesRequireExplicitChoice()
+            try writer.testDraftLockBlocksASecondWriterUntilReleased()
+            try writer.testUnexpectedNestedBlockInDraftIsRejected()
         } catch { XCTFail("Unexpected error: \(error)") }
-        if failures.isEmpty { print("PASS: 29 verification scenarios (offline; no real Notion requests)") }
+        if failures.isEmpty { print("PASS: 31 verification scenarios (offline; no real Notion requests)") }
         else { for failure in failures { print(failure) }; exit(1) }
     }
 }

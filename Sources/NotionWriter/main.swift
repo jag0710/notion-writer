@@ -12,7 +12,7 @@ import NotionWriterCore
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         NSApp.appearance = NSAppearance(named: .aqua)
-        do { state = try AppState(qa: CommandLine.arguments.contains("--qa")) }
+        do { state = try AppState(qa: CommandLine.arguments.contains("--qa"), exclusiveStore: true) }
         catch {
             let alert = NSAlert(error: error); alert.messageText = "保存済みデータを安全に開けませんでした"; alert.informativeText = "既存ファイルを上書きせず終了します。\n" + error.localizedDescription
             alert.runModal(); NSApp.terminate(nil); return

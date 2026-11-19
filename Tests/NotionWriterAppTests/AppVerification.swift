@@ -31,6 +31,8 @@ private final class OfflineProtocol: URLProtocol {
     static var pageRequests = 0
     static var pagePayload: Data?
     static var pageParentOverride: [String: String]?
+    static var moveAfterFirstAppend = false
+    static var databaseChangesAfterUpload = false
     static let pageID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     static let uploadIDs = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"]
     static var uploadCount = 0
@@ -46,6 +48,9 @@ private final class OfflineProtocol: URLProtocol {
         if path.contains("databases/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.databaseID) ? $0 : nil } ?? TestDestination.target
             value = TestDestination.database(target)
+            if Self.databaseChangesAfterUpload && Self.uploadCount > 0 {
+                value["data_sources"] = [["id": UUID().uuidString]]
+            }
         } else if path.contains("data_sources/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.dataSourceID) ? $0 : nil } ?? TestDestination.target
             value = TestDestination.source(target, properties: ["名前": ["id": "title", "name": "名前", "type": "title"]])
@@ -62,12 +67,23 @@ private final class OfflineProtocol: URLProtocol {
             Self.pageRequests += 1; Self.pagePayload = request.httpBody ?? readBody(request.httpBodyStream)
             status = Self.pageStatus
             let fields = Self.pagePayload.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-            let parent = Self.pageParentOverride ?? fields?["parent"] as? [String: String] ?? [:]
-            value = status == 200 ? ["object": "page", "id": Self.pageID, "parent": parent] : ["message": "offline verification rejection"]
+            var parent = fields?["parent"] as? [String: String] ?? [:]
+            let destination = Self.alternateDestination.flatMap { $0.dataSourceID == parent["data_source_id"] ? $0 : nil }
+            parent["database_id"] = (destination ?? TestDestination.target).databaseID
+            if let override = Self.pageParentOverride { parent = override }
+            value = status == 200 ? ["object": "page", "id": Self.pageID, "parent": parent] :
+                ["object": "error", "code": "validation_error", "status": status, "message": "offline verification rejection"]
+        } else if path == "/v1/pages/" + Self.pageID, request.httpMethod == "GET" {
+            var parent = ["type": "data_source_id", "data_source_id": TestDestination.dataSourceID,
+                          "database_id": TestDestination.databaseID]
+            if Self.moveAfterFirstAppend && !Self.appendPaths.isEmpty { parent["database_id"] = UUID().uuidString }
+            value = ["object": "page", "id": Self.pageID, "parent": parent]
         } else if request.httpMethod == "PATCH" && path.hasSuffix("/children") {
             Self.appendPaths.append(path)
             status = Self.appendStatus
-            value = ["object": "list"]
+            let body = request.httpBody ?? readBody(request.httpBodyStream) ?? Data()
+            let fields = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+            value = ["object": "list", "results": fields?["children"] ?? []]
         } else {
             status = 500; value = ["message": "Unexpected verification request"]
         }
@@ -153,6 +169,18 @@ private final class OfflineProtocol: URLProtocol {
             try require(state.draft.isEmpty, "Successful batched write left a draft")
             print("PASS: over 100 blocks are appended to the one newly created page")
 
+            state.draft = source
+            OfflineProtocol.pageRequests = 0; OfflineProtocol.appendPaths = []
+            OfflineProtocol.moveAfterFirstAppend = true
+            await state.submit()
+            OfflineProtocol.moveAfterFirstAppend = false
+            let moved = try Self.state(root: root).draft
+            try require(OfflineProtocol.pageRequests == 1 && OfflineProtocol.appendPaths == [target],
+                        "Writer patched a page after it moved to another database")
+            try require(moved.body == source.body && moved.submissionPending && moved.pendingPageID == OfflineProtocol.pageID,
+                        "Moving the page lost the draft or its recovery link")
+            print("PASS: moving a page between continuation requests stops further writes")
+
             state.draft = source; OfflineProtocol.pageRequests = 0; OfflineProtocol.appendPaths = []
             OfflineProtocol.appendStatus = 503
             await state.submit()
@@ -164,7 +192,8 @@ private final class OfflineProtocol: URLProtocol {
 
             state.draft = source
             OfflineProtocol.pageRequests = 0; OfflineProtocol.appendPaths = []; OfflineProtocol.appendStatus = 200
-            OfflineProtocol.pageParentOverride = ["type": "data_source_id", "data_source_id": UUID().uuidString]
+            OfflineProtocol.pageParentOverride = ["type": "data_source_id", "data_source_id": TestDestination.dataSourceID,
+                                                  "database_id": UUID().uuidString]
             await state.submit()
             try require(OfflineProtocol.pageRequests == 1 && OfflineProtocol.appendPaths.isEmpty, "Writer appended to a page with a different parent")
             try require(state.draft.submissionPending && state.draft.body == source.body, "Unexpected page parent cleared the draft")
@@ -389,6 +418,14 @@ private final class OfflineProtocol: URLProtocol {
             OfflineProtocol.uploadCount = 0
             OfflineProtocol.pageStatus = 200
             OfflineProtocol.pageRequests = 0
+            OfflineProtocol.databaseChangesAfterUpload = true
+            let beforeUpload = imageState.draft
+            await imageState.submit()
+            OfflineProtocol.databaseChangesAfterUpload = false
+            try require(OfflineProtocol.uploadCount == 2 && OfflineProtocol.pageRequests == 0 &&
+                        imageState.draft.formattedBody == beforeUpload.formattedBody && !imageState.draft.submissionPending,
+                        "Writer created a page after the database changed during image upload")
+            print("PASS: a data source change during image uploads stops page creation")
             await imageState.submit()
             try require(OfflineProtocol.pageRequests == 1 && imageState.draft.isEmpty, "Inline image save failed: \(imageState.status)")
             let sent = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
@@ -468,7 +505,7 @@ private final class OfflineProtocol: URLProtocol {
             try require(sharedState.draft.title == "本番用だけの下書き", "Switching back lost the main draft")
             OfflineProtocol.alternateDestination = nil
             print("PASS: read-only destination verification, cancellation and isolated destination switching")
-            print("PASS: 15 app-level scenarios (isolated temporary data; no Keychain or real Notion requests)")
+            print("PASS: 17 app-level scenarios (isolated temporary data; no Keychain or real Notion requests)")
         } catch { print("FAIL: \(error)"); exit(1) }
     }
 }

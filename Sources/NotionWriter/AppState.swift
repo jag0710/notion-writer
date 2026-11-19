@@ -22,13 +22,13 @@ import NotionWriterCore
     var display = DisplayPreferences.load()
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
-    init(qa: Bool, dataRoot: URL? = nil, clientOverride: (() throws -> NotionClient)? = nil) throws {
+    init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil) throws {
         self.clientOverride = clientOverride
         self.qa = qa
         let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                appropriateFor: nil, create: true)
             .appendingPathComponent(qa ? "Notion Writer Preview" : "Notion Writer", isDirectory: true)
-        store = try LocalStore(root: dataRoot ?? base)
+        store = try LocalStore(root: dataRoot ?? base, exclusive: exclusiveStore)
         activeDestination = qa ? nil : try store.read(NotionDestination.self, name: "destination")
         try activeDestination?.validateIDs()
         let storedConnection = activeDestination?.connection
@@ -135,8 +135,7 @@ import NotionWriterCore
         defer { busy = false; updated?() }
         do {
             let api = try client()
-            // Only metadata is fetched. Never read or query existing cards.
-            let fresh = try await api.fetchSchema(destination: target)
+            var fresh = try await api.fetchSchema(destination: target)
             // Validate the entire save before opening uploads or creating a page.
             let placeholder = "00000000-0000-0000-0000-000000000000"
             if !draft.images.isEmpty {
@@ -144,14 +143,19 @@ import NotionWriterCore
                 _ = try PagePayload.prepare(draft: draft, schema: fresh, uploadedImages: placeholders, destination: target)
             }
             var uploadedImages: [String: String] = [:]
+            var uploadedDuringSave = false
             for index in draft.images.indices {
                 if let id = draft.images[index].reusableUploadID() { uploadedImages[draft.images[index].id] = id; continue }
                 status = "画像を送信中 \(index + 1)/\(draft.images.count)…"; updated?()
                 let image = draft.images[index]
                 let data = try Data(contentsOf: ImageAttachments.url(for: image, root: store.root), options: .mappedIfSafe)
                 let id = try await api.uploadImage(data: data, filename: image.localFile, contentType: image.contentType)
+                uploadedDuringSave = true
                 draft.images[index].uploadID = id; draft.images[index].uploadExpiresAt = Date().addingTimeInterval(50 * 60)
                 uploadedImages[image.id] = id; try flush()
+            }
+            if uploadedDuringSave {
+                fresh = try await api.fetchSchema(destination: target)
             }
             let delivery = try PagePayload.prepare(draft: draft, schema: fresh, uploadedImages: uploadedImages, destination: target)
             status = "ページを保存中…"; updated?()
@@ -164,14 +168,12 @@ import NotionWriterCore
                 if case WriterError.uncertain = error { throw error }
                 draft.submissionPending = false; try flush(); throw error
             }
-            if !delivery.continuation.isEmpty {
-                draft.pendingPageID = page.id
-                try flush()
-                for (index, payload) in delivery.continuation.enumerated() {
-                    status = "本文を送信中 \(index + 2)/\(delivery.continuation.count + 1)…"
-                    updated?()
-                    try await api.appendChildren(to: page, payload: payload)
-                }
+            draft.pendingPageID = page.id
+            try flush()
+            for (index, payload) in delivery.continuation.enumerated() {
+                status = "本文を送信中 \(index + 2)/\(delivery.continuation.count + 1)…"
+                updated?()
+                try await api.appendChildren(to: page, payload: payload)
             }
             // Keep a local receipt with the original draft if clearing fails.
             try store.write(draft, name: "last-saved-draft")

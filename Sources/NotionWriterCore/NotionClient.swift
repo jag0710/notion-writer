@@ -3,9 +3,15 @@ import Foundation
 public struct NotionClient {
     private let token: String
     private let session: URLSession
-    public init(token: String, session: URLSession = .shared) { self.token = token; self.session = session }
+    private static let directSession = URLSession(configuration: .ephemeral, delegate: NotionRedirectPolicy(), delegateQueue: nil)
+
+    public init(token: String, session: URLSession? = nil) {
+        self.token = token
+        self.session = session ?? Self.directSession
+    }
     private func request(_ path: String, method: String = "GET", body: Data? = nil, contentType: String = "application/json", ambiguousWrite: Bool = false, version: String = "2025-09-03") async throws -> [String: Any] {
-        var request = URLRequest(url: URL(string: "https://api.notion.com/v1/" + path)!)
+        var request = URLRequest(url: URL(string: "https://api.notion.com/v1/" + path)!,
+                                 cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = method; request.httpBody = body; request.timeoutInterval = 30
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         request.setValue(version, forHTTPHeaderField: "Notion-Version")
@@ -15,8 +21,8 @@ public struct NotionClient {
         catch { if ambiguousWrite { throw WriterError.uncertain }; throw error }
         guard let http = response as? HTTPURLResponse else { throw WriterError.uncertain }
         guard (200..<300).contains(http.statusCode) else {
-            if ambiguousWrite && (http.statusCode >= 500 || http.statusCode == 408) { throw WriterError.uncertain }
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if ambiguousWrite && !Self.isRejectedWrite(http.statusCode, json) { throw WriterError.uncertain }
             throw WriterError.api(http.statusCode, json?["message"] as? String ?? "通信に失敗しました。", http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init))
         }
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -25,6 +31,19 @@ public struct NotionClient {
         }
         return json
     }
+    private static func isRejectedWrite(_ status: Int, _ error: [String: Any]?) -> Bool {
+        guard error?["object"] as? String == "error", error?["status"] as? Int == status,
+              let code = error?["code"] as? String else { return false }
+        switch (status, code) {
+        case (400, "invalid_json"), (400, "validation_error"),
+             (401, "unauthorized"), (403, "restricted_resource"),
+             (404, "object_not_found"), (429, "rate_limited"):
+            return true
+        default:
+            return false
+        }
+    }
+
     public func discoverDestination(databaseID: UUID, viewID: UUID?) async throws -> (NotionDestination, Schema) {
         let id = databaseID.uuidString.lowercased()
         let database = try await fetchDatabase(id)
@@ -106,7 +125,11 @@ public struct NotionClient {
     }
     public struct CreatedPage {
         public let id: String
-        fileprivate init(id: String) { self.id = id }
+        fileprivate let destination: NotionDestination
+        fileprivate init(id: String, destination: NotionDestination) {
+            self.id = id
+            self.destination = destination
+        }
     }
 
     public func createPage(payload: Data, destination: NotionDestination) async throws -> CreatedPage {
@@ -116,11 +139,8 @@ public struct NotionClient {
             throw WriterError.validation("作成リクエストの保存先が一致しません。送信を中止しました。")
         }
         let response = try await request("pages", method: "POST", body: payload, ambiguousWrite: true)
-        guard response["object"] as? String == "page", let id = response["id"] as? String,
-              UUID(uuidString: id) != nil, matchesParent(response["parent"], destination: destination) else {
-            throw WriterError.uncertain
-        }
-        return CreatedPage(id: id)
+        guard let id = confirmedPageID(response, destination: destination) else { throw WriterError.uncertain }
+        return CreatedPage(id: id, destination: destination)
     }
 
     private func matchesParent(_ value: Any?, destination: NotionDestination) -> Bool {
@@ -129,9 +149,29 @@ public struct NotionClient {
         return parent["database_id"].map { $0.lowercased() == destination.databaseID } ?? true
     }
 
+    private func confirmedPageID(_ fields: [String: Any], destination: NotionDestination) -> String? {
+        guard fields["object"] as? String == "page", let id = fields["id"] as? String,
+              let uuid = UUID(uuidString: id), fields["in_trash"] as? Bool != true,
+              fields["archived"] as? Bool != true,
+              let parent = fields["parent"] as? [String: String],
+              parent["database_id"]?.lowercased() == destination.databaseID,
+              matchesParent(parent, destination: destination) else { return nil }
+        return uuid.uuidString.lowercased()
+    }
+
     public func appendChildren(to page: CreatedPage, payload: Data) async throws {
+        guard let fields = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              fields.keys.count == 1, let children = fields["children"] as? [[String: Any]],
+              !children.isEmpty, children.count <= 100 else {
+            throw WriterError.validation("追記する本文を読み取れません。下書きは保持します。")
+        }
+        let current = try await request("pages/" + page.id)
+        guard confirmedPageID(current, destination: page.destination) == page.id else {
+            throw WriterError.validation("作成したページの保存先または状態が変わったため、本文の追記を中止しました。")
+        }
         let response = try await request("blocks/" + page.id + "/children", method: "PATCH", body: payload, ambiguousWrite: true)
-        guard response["object"] as? String == "list" else { throw WriterError.uncertain }
+        guard response["object"] as? String == "list", let results = response["results"] as? [[String: Any]],
+              results.count == children.count else { throw WriterError.uncertain }
     }
 
     public func uploadImage(data: Data, filename: String, contentType: String) async throws -> String {
@@ -148,4 +188,12 @@ public struct NotionClient {
         return id
     }
 
+}
+
+private final class NotionRedirectPolicy: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                    completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
 }
