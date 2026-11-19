@@ -116,12 +116,12 @@ import NotionWriterCore
         setupButton.title = setup.isHidden ? "接続の設定・変更…" : "接続の設定を閉じる"
 
         setup.addArrangedSubview(label("① Notionで接続を用意する", size: 13))
-        explain("内部接続を作成し、「コンテンツの読み取り」と「コンテンツの挿入」を有効にします。接続の詳細画面からAPIトークンをコピーしてください。すでに接続があれば再利用できます。", in: setup)
+        explain("Notionで内部接続を作成します。新規メモを保存するには「コンテンツを読み取る」と「コンテンツを挿入」をオンにします。「コンテンツを更新」はオフで使えます。APIトークンは接続の「設定」からコピーします。", in: setup)
         setup.addArrangedSubview(linkButton("Notionの接続管理を開く ↗", action: #selector(openConnections)))
-        setup.addArrangedSubview(label("② 保存先のデータベースに接続を追加する", size: 13))
-        explain("保存先DBをNotionで開き、右上の「•••」→「接続」から①で用意した接続を追加します。", in: setup)
+        setup.addArrangedSubview(label("② 接続に保存先のデータベースを追加する", size: 13))
+        explain("接続管理で①の接続を開き、「コンテンツへのアクセス」→「アクセス権限を編集」へ進みます。「ページを検索する」に保存先のデータベース名を入力し、検索結果からデータベース本体を選んで保存します。", in: setup)
         setup.addArrangedSubview(label("③ 保存先とトークンを登録する", size: 13))
-        explain("保存先DBのリンクを確認し、①のAPIトークンを入力してください。", in: setup)
+        explain("Notionで保存先のデータベースを開き、右上の「•••」→「リンクをコピー」で取得したリンクとAPIトークンを入力します。2台目のMacでは、同じリンクと既存のトークンを使います。", in: setup)
         setup.addArrangedSubview(label("保存先データベースのリンク", size: 12))
         database.placeholderString = "Notionでコピーしたデータベースのリンク"
         updateConnectionFields()
@@ -131,7 +131,7 @@ import NotionWriterCore
         explain("トークンはMacのキーチェーンに保存します。保存済みの値はこの画面に表示しません。", in: setup)
         connectButton.target = self; connectButton.action = #selector(connect); connectButton.bezelStyle = .rounded
         setup.addArrangedSubview(connectButton)
-        explain("接続確認ではメモを作成しません。確認に成功すると、プロパティとタグを取得して入力画面で使えるようになります。", in: setup)
+        explain("接続確認で表示されたデータベース名を確認し、「保存先に設定」を押します。同期したプロパティとタグは入力画面で使えます。", in: setup)
         setup.addArrangedSubview(linkButton("Notion公式の接続ガイド ↗", action: #selector(openConnectionHelp)))
         for view in [database, token] {
             view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -214,7 +214,7 @@ import NotionWriterCore
         openDatabaseButton.isEnabled = state.activeDestination != nil
         syncButton.isEnabled = state.connection != nil && !state.busy && !state.syncing && !connecting
         connectionTitle.stringValue = state.activeDestination.map { "設定済み · " + $0.name } ?? "未接続"
-        connectionDetail.stringValue = state.connection == nil ? "下の①〜③で設定すると、Notionへ保存できるようになります。" : "保存先が登録されています。通常は設定し直す必要はありません。"
+        connectionDetail.stringValue = state.connection == nil ? "初めて接続する場合は①から、別のMacで設定済みの保存先を使う場合は③から進めます。" : "保存先が登録されています。通常は設定し直す必要はありません。"
         if let schema = state.schema {
             let date = DateFormatter(); date.dateStyle = .short; date.timeStyle = .short
             syncDetail.stringValue = "プロパティの最終同期：" + date.string(from: schema.syncedAt)
@@ -272,7 +272,7 @@ import NotionWriterCore
                 }
                 token.stringValue = ""
                 updateConnectionFields()
-                connectionFeedback = "接続を確認しました。入力画面からNotionへ保存できます。"
+                connectionFeedback = "接続を確認し、プロパティとタグを同期しました。"
                 setup.isHidden = true; setupButton.title = "接続の設定・変更…"
             } catch is CancellationError { connectionFeedback = nil }
             catch { connectionFeedback = connectionError(error) }
@@ -285,7 +285,7 @@ import NotionWriterCore
         if case WriterError.api(let status, _, _) = error {
             switch status {
             case 401: return "APIトークンを確認できませんでした。①の接続管理画面からコピーし直して、③に貼り付けてください。"
-            case 403, 404: return "保存先にアクセスできませんでした。②で保存先に接続を追加したか、①で読み取り権限を有効にしたか確認してください。"
+            case 403, 404: return "保存先にアクセスできませんでした。①で「コンテンツを読み取る」がオンか、②で保存先のデータベースを選んで保存したか確認してください。"
             case 429: return "Notionのリクエスト上限に達しました。少し待ってから、もう一度お試しください。"
             default: break
             }
