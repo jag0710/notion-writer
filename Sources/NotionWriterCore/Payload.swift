@@ -118,13 +118,49 @@ public enum PagePayload {
         return delivery.create
     }
 
+    public struct BookmarkPreview: Sendable {
+        public let title: String
+        public let summary: String?
+        public let thumbnailUploadID: String?
+
+        public init(title: String, summary: String?, thumbnailUploadID: String?) {
+            self.title = title
+            self.summary = summary
+            self.thumbnailUploadID = thumbnailUploadID
+        }
+    }
+
+    private static func bookmarkBlock(_ original: [String: Any], url: URL, preview: BookmarkPreview) -> [String: Any] {
+        let title = String(preview.title.prefix(300))
+        let label = chunks(title.isEmpty ? (url.host ?? url.absoluteString) : title).map {
+            ["type": "text", "text": ["content": $0, "link": ["url": url.absoluteString]], "annotations": ["bold": true]] as [String: Any]
+        }
+        guard let uploadID = preview.thumbnailUploadID, UUID(uuidString: uploadID) != nil else {
+            var content = original["bookmark"] as? [String: Any] ?? [:]
+            if content["caption"] == nil && !title.isEmpty { content["caption"] = label }
+            return ["object": "block", "type": "bookmark", "bookmark": content]
+        }
+        let image = uploadedImage(uploadID)
+        var text = label
+        if let summary = preview.summary, !summary.isEmpty {
+            text += chunks("\n" + String(summary.prefix(400))).map { ["type": "text", "text": ["content": $0]] }
+        }
+        return ["object": "block", "type": "callout", "callout": [
+            "rich_text": text, "icon": ["type": "emoji", "emoji": "🔗"], "color": "gray_background", "children": [image]
+        ]]
+    }
+
+    private static func uploadedImage(_ id: String) -> [String: Any] {
+        ["object": "block", "type": "image", "image": ["type": "file_upload", "file_upload": ["id": id]]]
+    }
+
     public struct Delivery {
         public let create: Data
         public let continuation: [Data]
     }
 
     public static func prepare(draft: Draft, schema: Schema, uploadedImages: [String: String] = [:],
-                               destination: NotionDestination) throws -> Delivery {
+                               bookmarkPreviews: [URL: BookmarkPreview] = [:], destination: NotionDestination) throws -> Delivery {
         try destination.validate(schema)
         guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WriterError.validation("文章を入力してください。") }
         guard let title = schema.properties.first(where: { $0.type == "title" }) else { throw WriterError.validation("タイトルプロパティが見つかりません。再同期してください。") }
@@ -146,11 +182,14 @@ public enum PagePayload {
         let body: [String: Any] = ["parent": ["type": "data_source_id", "data_source_id": schema.dataSourceID], "properties": properties]
         let images = Set(draft.images.map(\.id))
         let children = try bodyWithImages(draft).map { block in
+            if let url = bookmarkURL(in: block), let preview = bookmarkPreviews[url] {
+                return bookmarkBlock(block, url: url, preview: preview)
+            }
             guard let imageID = imageReferenceID(block) else { return block }
             guard images.contains(imageID), let uploadID = uploadedImages[imageID], UUID(uuidString: uploadID) != nil else {
                 throw WriterError.validation("画像の送信が完了していません。下書きは保持しています。")
             }
-            return ["object": "block", "type": "image", "image": ["type": "file_upload", "file_upload": ["id": uploadID]]]
+            return uploadedImage(uploadID)
         }
         return try batch(page: body, blocks: children)
     }

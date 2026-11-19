@@ -60,7 +60,8 @@ enum ImageAttachments {
             return file.pathExtension == "json" && (name.hasPrefix("draft-") ||
                 name == "last-saved-draft.json" || name == "confirmed-saved-draft.json")
         }
-        var retained = Set<String>()
+        let history = try LocalStore(root: root).read([SendRecord].self, name: SendRecord.filename) ?? []
+        var retained = Set(history.flatMap { $0.draft.images.map(\.localFile) })
         for file in draftFiles {
             let draft = try JSONDecoder().decode(Draft.self, from: Data(contentsOf: file))
             retained.formUnion(draft.images.map(\.localFile))

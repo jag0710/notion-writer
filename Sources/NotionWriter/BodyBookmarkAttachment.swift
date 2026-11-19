@@ -1,5 +1,4 @@
 import AppKit
-import ImageIO
 
 final class BodyBookmarkAttachment: NSTextAttachment {
     let url: URL
@@ -19,18 +18,13 @@ final class BodyBookmarkAttachment: NSTextAttachment {
         guard !requestedPreview, editor.window?.isVisible == true else { return }
         requestedPreview = true
         Task { [weak self, weak editor] in
-            guard let url = self?.url, let document = try? await WebDocument.load(url),
-                  let title = document.title() else { return }
-            let description = document.meta("og:description") ?? document.meta("description")
-            self?.show(title: title, description: description, thumbnail: nil, editor: editor)
-            guard let image = WebResource.url(document.meta("og:image") ?? document.meta("twitter:image"), relativeTo: document.base),
-                  let (data, _) = try? await WebResource.read(image, limit: 5 * 1024 * 1024),
-                  let source = CGImageSourceCreateWithData(data as CFData, nil),
-                  let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, nil) ?? CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                    kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 480,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                  ] as CFDictionary) else { return }
-            self?.show(title: title, description: description, thumbnail: NSImage(cgImage: thumbnail, size: .zero), editor: editor)
+            guard let url = self?.url else { return }
+            if let metadata = await BookmarkPreviews.shared.metadata(url) {
+                self?.show(title: metadata.title, description: metadata.summary, thumbnail: nil, editor: editor)
+            }
+            guard let preview = await BookmarkPreviews.shared.load(url),
+                  let thumbnail = preview.thumbnail.flatMap(NSImage.init(data:)) else { return }
+            self?.show(title: preview.title, description: preview.summary, thumbnail: thumbnail, editor: editor)
         }
     }
 

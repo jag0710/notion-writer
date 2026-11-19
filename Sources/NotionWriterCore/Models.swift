@@ -51,9 +51,10 @@ public struct Draft: Codable, Equatable, Sendable {
     // Persisted before POST. A crash or lost response must never silently resubmit.
     public var submissionPending = false
     public var pendingPageID: String?
+    public var submissionID: UUID?
     public var images: [DraftImage] = []
     public init() {}
-    private enum CodingKeys: String, CodingKey { case title, tags, urls, body, bodyFormat, formattedBody, submissionPending, pendingPageID, images }
+    private enum CodingKeys: String, CodingKey { case title, tags, urls, body, bodyFormat, formattedBody, submissionPending, pendingPageID, submissionID, images }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         title = try values.decode(String.self, forKey: .title)
@@ -64,6 +65,7 @@ public struct Draft: Codable, Equatable, Sendable {
         formattedBody = try values.decodeIfPresent(Data.self, forKey: .formattedBody)
         submissionPending = try values.decode(Bool.self, forKey: .submissionPending)
         pendingPageID = try values.decodeIfPresent(String.self, forKey: .pendingPageID)
+        submissionID = try values.decodeIfPresent(UUID.self, forKey: .submissionID)
         images = try values.decodeIfPresent([DraftImage].self, forKey: .images) ?? []
     }
     public var isEmpty: Bool { title.isEmpty && body.isEmpty && images.isEmpty && tags.values.allSatisfy(\.isEmpty) && urls.values.allSatisfy(\.isEmpty) }

@@ -9,6 +9,7 @@ import NotionWriterCore
     let hotKey = HotKey()
     var hotKeyWarning: String?
     var shortcutItem: NSMenuItem!
+    private var statusReset: Task<Void, Never>?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         NSApp.appearance = NSAppearance(named: .aqua)
@@ -19,10 +20,10 @@ import NotionWriterCore
         }
         if !state.qa { try? ImageAttachments.tidyCache(root: state.store.root) }
         state.updated = { [weak self] in self?.writer?.update(); self?.settings?.update() }
-        state.saved = { [weak self] in
-            guard let self else { return }
-            self.writer?.update(); self.writer?.resetAfterSave(); self.writer?.hide(); self.item.button?.title = "✓ 保存しました"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.item.button?.title = self?.item.button?.image == nil ? "W" : "" }
+        state.submissionStarted = { [weak self] in self?.setStatusMark() }
+        state.saved = { [weak self] in self?.showSuccess() }
+        state.submissionFailed = { [weak self] in
+            self?.setStatusMark("!", help: "送信を確認してください。設定の「直近5件」で状態を確認できます。")
         }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let url = Bundle.main.url(forResource: "WriterIcon", withExtension: "png"), let original = NSImage(contentsOf: url) {
@@ -35,7 +36,7 @@ import NotionWriterCore
             item.button?.image = menuIcon
         }
         if item.button?.image == nil { item.button?.title = "W" }
-        item.button?.setAccessibilityLabel("Notion Writer")
+        item.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Notion Writer")
         let menu = NSMenu()
         let openItem = NSMenuItem(title: "入力ウィンドウを表示 / 非表示", action: #selector(toggle), keyEquivalent: ""); openItem.target = self; menu.addItem(openItem)
         shortcutItem = NSMenuItem(title: "", action: nil, keyEquivalent: ""); menu.addItem(shortcutItem)
@@ -50,6 +51,21 @@ import NotionWriterCore
         edit.submenu = editMenu; appMenu.addItem(edit); NSApp.mainMenu = appMenu
         hotKey.action = { [weak self] in self?.toggle() }; register(Shortcut.load())
         if CommandLine.arguments.contains("--show") || state.qa { showWriter() }
+    }
+    private func setStatusMark(_ mark: String = "", help: String? = nil) {
+        statusReset?.cancel()
+        statusReset = nil
+        guard let button = item.button else { return }
+        button.title = button.image == nil ? (mark.isEmpty ? "W" : "W " + mark) : mark
+        button.toolTip = mark == "!" ? help : nil
+        button.setAccessibilityHelp(help)
+    }
+    private func showSuccess() {
+        setStatusMark("✓", help: "Notionに保存しました")
+        statusReset = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(2500)) } catch { return }
+            self?.setStatusMark()
+        }
     }
     func register(_ shortcut: Shortcut) {
         hotKeyWarning = hotKey.register(shortcut)

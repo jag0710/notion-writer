@@ -14,7 +14,13 @@ import NotionWriterCore
     private(set) var draftRevision = 0
     var importingImages = false
     var updated: (() -> Void)?
+    var submissionStarted: (() -> Void)?
     var saved: (() -> Void)?
+    var submissionFailed: (() -> Void)?
+    private let bookmarkPreview: @Sendable (URL) async -> BookmarkPreview?
+    private(set) var recentSends: [SendRecord]
+    private(set) var sendingID: UUID?
+    private(set) var historyFeedback: String?
     private var pendingSave: DispatchWorkItem?
     private var generation = 0
     private let clientOverride: (() throws -> NotionClient)?
@@ -26,18 +32,28 @@ import NotionWriterCore
     }
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
-    init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil) throws {
+    init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil,
+         bookmarkPreview: @escaping @Sendable (URL) async -> BookmarkPreview? = { await BookmarkPreviews.shared.load($0) }) throws {
         self.clientOverride = clientOverride
+        self.bookmarkPreview = bookmarkPreview
         self.qa = qa
-        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                               appropriateFor: nil, create: true)
-            .appendingPathComponent(qa ? "Notion Writer Preview" : "Notion Writer", isDirectory: true)
-        store = try LocalStore(root: dataRoot ?? base, exclusive: exclusiveStore)
-        activeDestination = qa ? nil : try store.read(NotionDestination.self, name: "destination")
-        try activeDestination?.validateIDs()
-        let storedConnection = activeDestination?.connection
-        schema = try store.read(Schema.self, name: cacheName(storedConnection))
-        draft = try store.read(Draft.self, name: store.draftName(for: storedConnection)) ?? Draft()
+        let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Notion Writer"
+        let base = if let dataRoot {
+            dataRoot
+        } else {
+            try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                        appropriateFor: nil, create: true)
+                .appendingPathComponent(qa ? name + " Preview" : name, isDirectory: true)
+        }
+        let local = try LocalStore(root: base, exclusive: exclusiveStore)
+        let destination = qa ? nil : try local.read(NotionDestination.self, name: "destination")
+        try destination?.validateIDs()
+        let storedConnection = destination?.connection
+        store = local
+        activeDestination = destination
+        schema = try local.read(Schema.self, name: cacheName(storedConnection))
+        draft = try local.read(Draft.self, name: local.draftName(for: storedConnection)) ?? Draft()
+        recentSends = try SendRecord.load(from: local, destination: destination)
         if draft.submissionPending { status = pendingSaveMessage }
         else if let target = activeDestination { status = target.name + " · キャッシュを表示中" }
     }
@@ -45,6 +61,7 @@ import NotionWriterCore
         display = value.normalized(); display.save(); updated?()
     }
     func edited() {
+        if !draft.submissionPending { draft.submissionID = nil }
         pendingSave?.cancel()
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -94,8 +111,10 @@ import NotionWriterCore
             let result = try await client().fetchSchema(destination: target)
             guard current == generation else { syncing = false; updated?(); return }
             try store.write(result, name: cacheName(connection)); schema = result
-            status = target.name + " · " + (result.viewName.map { $0 + "の順序で同期済み" } ?? "同期済み")
-        } catch { applyError(error) }
+            if !busy { status = target.name + " · " + (result.viewName.map { $0 + "の順序で同期済み" } ?? "同期済み") }
+        } catch {
+            if !busy { applyError(error) }
+        }
         syncing = false; updated?()
     }
     func connect(database: String, token: String, confirm: (NotionDestination) -> Bool) async throws {
@@ -144,68 +163,203 @@ import NotionWriterCore
         generation += 1; activeDestination = target; schema = result; draft = nextDraft
         status = target.name + " · 接続済み"
     }
-    func submit() async {
+    func submit(onAccepted: (() -> Void)? = nil) async {
         guard !busy, !importingImages, !changingDestination else { return }
         guard !draft.submissionPending else { status = pendingSaveMessage; updated?(); return }
-        guard Date() >= retryNotBefore else { status = "Notionの待機時間が終わってから保存してください。"; updated?(); return }
-        guard let connection, let target = activeDestination else { status = "設定でNotionに接続してください。プレビューのタグは送信されません。"; updated?(); return }
-        guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { status = "文章を入力してください。"; updated?(); return }
-        busy = true; status = "保存中…"; updated?()
-        defer { busy = false; updated?() }
-        do {
-            let api = try client()
-            var fresh = try await api.fetchSchema(destination: target)
-            // Validate the entire save before opening uploads or creating a page.
-            let placeholder = "00000000-0000-0000-0000-000000000000"
-            if !draft.images.isEmpty {
-                let placeholders = Dictionary(draft.images.map { ($0.id, placeholder) }, uniquingKeysWith: { first, _ in first })
-                _ = try PagePayload.prepare(draft: draft, schema: fresh, uploadedImages: placeholders, destination: target)
+        guard let target = activeDestination else {
+            status = "設定でNotionに接続してください。プレビューのタグは送信されません。"
+            updated?()
+            return
+        }
+
+        let id = draft.submissionID ?? UUID()
+        if let result = recentSends.first(where: { $0.id == id })?.result, result != .failed {
+            status = result == .sent ? "この入力はすでにNotionに保存されています。" : pendingSaveMessage
+            updated?()
+            return
+        }
+        var snapshot = draft
+        snapshot.submissionID = id
+        let record = SendRecord(id: id, destination: target, attemptedAt: Date(), draft: snapshot, result: .failed)
+        await deliver(record, to: target, tracksEditor: true, onAccepted: onAccepted)
+    }
+
+    func canRetry(_ record: SendRecord) -> Bool {
+        !busy && !importingImages && !changingDestination && record.result != .sent && connection == record.destination.connection
+    }
+
+    func retry(_ id: UUID, confirmedMissing: Bool) async {
+        guard let record = recentSends.first(where: { $0.id == id }), canRetry(record), let target = activeDestination,
+              record.result != .uncertain || confirmedMissing else { return }
+        await deliver(record, to: target, tracksEditor: draft.submissionID == id, fromHistory: true)
+    }
+
+    private func saveRecord(_ record: SendRecord) throws {
+        let otherRecords = recentSends.filter { $0.id != record.id }
+        let next = Array(([record] + otherRecords).sorted { $0.attemptedAt > $1.attemptedAt }.prefix(SendRecord.limit))
+        try store.write(next, name: SendRecord.filename)
+        recentSends = next
+    }
+
+    private func writeEditor(_ value: Draft) throws {
+        try store.write(value, name: store.draftName(for: connection))
+        pendingSave?.cancel()
+        pendingSave = nil
+        draft = value
+    }
+
+    private func deliver(_ source: SendRecord, to target: NotionDestination, tracksEditor: Bool,
+                         fromHistory: Bool = false, onAccepted: (() -> Void)? = nil) async {
+        var record = source
+        var accepted = false
+        defer {
+            if accepted {
+                sendingID = nil
+                busy = false
             }
+            updated?()
+        }
+        do {
+            guard Date() >= retryNotBefore else { throw WriterError.validation("Notionの待機時間が終わってから送信してください。") }
+            let blocks = try PagePayload.bodyWithImages(record.draft)
+            guard !record.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw WriterError.validation("文章を入力してください。")
+            }
+            let api = try client()
+            record.attemptedAt = Date()
+            record.draft.submissionPending = false
+            record.draft.pendingPageID = nil
+            record.result = .failed
+            record.pageID = nil
+            try saveRecord(record)
+            if tracksEditor { try writeEditor(record.draft) }
+            busy = true
+            accepted = true
+            sendingID = record.id
+            historyFeedback = nil
+            status = "保存中…"
+            onAccepted?()
+            submissionStarted?()
+            updated?()
+
+            var fresh = try await api.fetchSchema(destination: target)
+            let placeholder = "00000000-0000-0000-0000-000000000000"
+            let placeholders = Dictionary(record.draft.images.map { ($0.id, placeholder) }, uniquingKeysWith: { first, _ in first })
+            _ = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: placeholders, destination: target)
+
+            let bookmarkURLs = blocks.compactMap(PagePayload.bookmarkURL(in:))
+            let previews = try await prepareBookmarks(bookmarkURLs, using: api)
             var uploadedImages: [String: String] = [:]
-            var uploadedDuringSave = false
-            for index in draft.images.indices {
-                if let id = draft.images[index].reusableUploadID() { uploadedImages[draft.images[index].id] = id; continue }
-                status = "画像を送信中 \(index + 1)/\(draft.images.count)…"; updated?()
-                let image = draft.images[index]
+            var uploadedDuringSave = previews.values.contains { $0.thumbnailUploadID != nil }
+            for index in record.draft.images.indices {
+                let image = record.draft.images[index]
+                if let id = image.reusableUploadID() {
+                    uploadedImages[image.id] = id
+                    continue
+                }
+                status = "画像を送信中 \(index + 1)/\(record.draft.images.count)…"
+                updated?()
                 let data = try Data(contentsOf: ImageAttachments.url(for: image, root: store.root), options: .mappedIfSafe)
                 let id = try await api.uploadImage(data: data, filename: image.localFile, contentType: image.contentType)
                 uploadedDuringSave = true
-                draft.images[index].uploadID = id; draft.images[index].uploadExpiresAt = Date().addingTimeInterval(50 * 60)
-                uploadedImages[image.id] = id; try flush()
+                record.draft.images[index].uploadID = id
+                record.draft.images[index].uploadExpiresAt = Date().addingTimeInterval(50 * 60)
+                uploadedImages[image.id] = id
+                try saveRecord(record)
+                if tracksEditor { try writeEditor(record.draft) }
             }
-            if uploadedDuringSave {
-                fresh = try await api.fetchSchema(destination: target)
+            if uploadedDuringSave { fresh = try await api.fetchSchema(destination: target) }
+            let delivery = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: uploadedImages,
+                                                   bookmarkPreviews: previews, destination: target)
+            status = "ページを保存中…"
+            updated?()
+            try store.write(fresh, name: cacheName(connection))
+            schema = fresh
+            if tracksEditor {
+                var pending = record.draft
+                pending.submissionPending = true
+                try writeEditor(pending)
             }
-            let delivery = try PagePayload.prepare(draft: draft, schema: fresh, uploadedImages: uploadedImages, destination: target)
-            status = "ページを保存中…"; updated?()
-            try store.write(fresh, name: cacheName(connection)); schema = fresh
-            draft.submissionPending = true
-            do { try flush() } catch { draft.submissionPending = false; throw error }
+            record.result = .uncertain
+            try saveRecord(record)
             let page: NotionClient.CreatedPage
-            do { page = try await api.createPage(payload: delivery.create, destination: target) }
-            catch {
+            do {
+                page = try await api.createPage(payload: delivery.create, destination: target)
+            } catch {
                 if case WriterError.uncertain = error { throw error }
-                draft.submissionPending = false; try flush(); throw error
+                record.result = .failed
+                try saveRecord(record)
+                if tracksEditor { try writeEditor(record.draft) }
+                throw error
             }
-            draft.pendingPageID = page.id
-            try flush()
+
+            record.pageID = page.id
+            try saveRecord(record)
+            if tracksEditor {
+                var pending = draft
+                pending.pendingPageID = page.id
+                try writeEditor(pending)
+            }
             for (index, payload) in delivery.continuation.enumerated() {
                 status = "本文を送信中 \(index + 2)/\(delivery.continuation.count + 1)…"
                 updated?()
                 try await api.appendChildren(to: page, payload: payload)
             }
-            // Keep a local receipt with the original draft if clearing fails.
-            try store.write(draft, name: "last-saved-draft")
-            try store.write(SaveReceipt(pageID: page.id, dataSourceID: fresh.dataSourceID, savedAt: Date()), name: "last-save-receipt")
-            let empty = Draft()
-            try store.write(empty, name: store.draftName(for: connection))
-            draftRevision += 1; draft = empty; status = "Notionに保存しました"; saved?()
+            record.result = .sent
+            try saveRecord(record)
+            if tracksEditor {
+                try writeEditor(Draft())
+                draftRevision += 1
+            }
+            status = "Notionに保存しました"
+            saved?()
         } catch {
             applyError(error)
-            if draft.pendingPageID != nil { status = pendingSaveMessage + "\n" + status }
+            if tracksEditor, draft.pendingPageID != nil { status = pendingSaveMessage + "\n" + status }
+            if fromHistory { historyFeedback = status }
+            if accepted { submissionFailed?() }
         }
     }
+
+    private func prepareBookmarks(_ urls: [URL], using api: NotionClient) async throws -> [URL: PagePayload.BookmarkPreview] {
+        var seen = Set<URL>()
+        let unique = urls.filter { seen.insert($0).inserted }
+        var results: [URL: PagePayload.BookmarkPreview] = [:]
+        guard !unique.isEmpty else { return results }
+        status = "ブックマークを準備中…"
+        updated?()
+        let load = bookmarkPreview
+        for start in stride(from: 0, to: unique.count, by: 4) {
+            let batch = unique[start..<min(start + 4, unique.count)]
+            let previews = await withTaskGroup(of: (URL, BookmarkPreview?).self) { group in
+                for url in batch { group.addTask { (url, await load(url)) } }
+                var previews: [URL: BookmarkPreview] = [:]
+                for await (url, preview) in group { previews[url] = preview }
+                return previews
+            }
+            for url in batch {
+                guard let preview = previews[url] else { continue }
+                var uploadID: String?
+                if let thumbnail = preview.thumbnail {
+                    do {
+                        uploadID = try await api.uploadImage(data: thumbnail, filename: "bookmark-thumbnail.jpg", contentType: "image/jpeg")
+                    } catch {
+                        if case WriterError.api(429, _, let retry) = error {
+                            // A thumbnail is optional. Honor Retry-After before sending the page.
+                            guard let retry, (0...10).contains(retry) else { throw error }
+                            try await Task.sleep(for: .seconds(retry))
+                        }
+                    }
+                }
+                results[url] = .init(title: preview.title, summary: preview.summary, thumbnailUploadID: uploadID)
+            }
+        }
+        return results
+    }
     var pendingSaveMessage: String {
+        if recentSends.contains(where: { $0.id == draft.submissionID && $0.result == .sent }) {
+            return "Notionへの送信は完了しています。「保存結果を確認…」から下書きを閉じられます。"
+        }
         if draft.pendingPageID != nil {
             return "Notionにページは作成済みです。本文が途中まで保存されている可能性があります。下書きは保持しています。"
         }
@@ -267,27 +421,29 @@ import NotionWriterCore
     }
     func resolvePending(discard: Bool) throws {
         guard !busy, !changingDestination else { return }
+        guard draft.submissionPending else { return }
         var next = draft
-        if discard {
+        if var record = recentSends.first(where: { $0.id == draft.submissionID }) {
+            guard discard || record.result != .sent else {
+                throw WriterError.validation("この送信は完了しています。下書きを閉じる操作を選んでください。")
+            }
+            record.result = discard ? .sent : .failed
+            if !discard { record.pageID = nil }
+            try saveRecord(record)
+        } else if discard {
             try store.write(draft, name: "confirmed-saved-draft")
+        }
+        if discard {
             next = Draft()
         } else {
             next.submissionPending = false
             next.pendingPageID = nil
         }
-        try store.write(next, name: store.draftName(for: connection))
-        pendingSave?.cancel(); pendingSave = nil
+        try writeEditor(next)
         if discard { draftRevision += 1 }
-        draft = next
         status = "保存結果を確認しました"; updated?()
     }
 }
 private func cacheName(_ connection: Connection?) -> String {
     "schema-" + (connection.map { $0.databaseID + "-" + $0.dataSourceID } ?? "offline")
-}
-
-private struct SaveReceipt: Codable {
-    let pageID: String
-    let dataSourceID: String
-    let savedAt: Date
 }

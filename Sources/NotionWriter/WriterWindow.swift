@@ -296,7 +296,11 @@ final class WriterPanel: NSPanel {
     func hide() {
         tagRows.forEach { $0.collapse() }
         do { try state.flush() } catch { showError(error); return }
-        window?.orderOut(nil); previousApp?.activate(options: [])
+        orderOut()
+    }
+    private func orderOut() {
+        window?.orderOut(nil)
+        previousApp?.activate(options: [])
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { hide(); return false }
     func textDidChange(_ notification: Notification) {
@@ -717,8 +721,7 @@ final class WriterPanel: NSPanel {
         guard bodyLoadError == nil else { return }
         if let editor = window?.firstResponder as? NSTextView, editor.hasMarkedText() { return }
         tagRows.forEach { $0.collapse() }
-        window?.makeKeyAndOrderFront(nil)
-        Task { await state.submit() }
+        Task { await state.submit { [weak self] in self?.orderOut() } }
     }
     @objc func resolvePending() {
         let alert = NSAlert(); alert.messageText = "Notionで保存結果を確認してください"

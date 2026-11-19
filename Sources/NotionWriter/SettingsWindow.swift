@@ -25,11 +25,22 @@ import NotionWriterCore
     var sizeSliders: [String: NSSlider] = [:]
     var sizeLabels: [String: NSTextField] = [:]
     var shortcutChanged: ((Shortcut) -> String?)?
+    private let historyRows = stack(.vertical, spacing: 14)
+    private let historyMessage = label("", size: 11, color: .secondaryLabelColor)
+    private var renderedHistory: [SendRecord] = []
+    private var historyButtons: [(SendRecord, NSButton)] = []
+    private let historyDates: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     init(state: AppState) {
         self.state = state
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 560), styleMask: [.titled,.closable], backing: .buffered, defer: false)
-        window.title = "Notion Writer 設定"; window.level = .floating; window.appearance = NSAppearance(named: .aqua)
+        let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Notion Writer"
+        window.title = appName + " 設定"; window.level = .floating; window.appearance = NSAppearance(named: .aqua)
         window.backgroundColor = .white; window.isReleasedWhenClosed = false
         super.init(window: window)
         let tabs = NSTabView(); tabs.translatesAutoresizingMaskIntoConstraints = false
@@ -45,6 +56,7 @@ import NotionWriterCore
         buildConnectionTab(addTab("Notion", to: tabs, scrollable: true))
         buildDisplayTab(addTab("表示", to: tabs))
         buildGeneralTab(addTab("一般", to: tabs))
+        buildHistoryTab(addTab("直近5件", to: tabs, scrollable: true))
         window.setContentSize(NSSize(width: 580, height: 560)); window.center(); update()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -82,6 +94,143 @@ import NotionWriterCore
         field.setContentCompressionResistancePriority(.required, for: .vertical)
         root.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
+    private func buildHistoryTab(_ root: NSStackView) {
+        explain("送信した内容をこのMacに5件まで保存します。未送信の内容は元の保存先へ再送できます。", in: root)
+        historyMessage.maximumNumberOfLines = 0
+        historyMessage.lineBreakMode = .byWordWrapping
+        historyMessage.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        root.addArrangedSubview(historyMessage)
+        root.addArrangedSubview(historyRows)
+        NSLayoutConstraint.activate([
+            historyMessage.widthAnchor.constraint(equalTo: root.widthAnchor),
+            historyRows.widthAnchor.constraint(equalTo: root.widthAnchor),
+        ])
+        explain("送信先を変更した場合は、元の保存先に接続すると再送できます。", in: root)
+    }
+
+    private func updateHistory() {
+        let records = state.recentSends
+        if renderedHistory != records {
+            for view in historyRows.arrangedSubviews {
+                historyRows.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            historyButtons = []
+            for record in records {
+                let row = stack(.vertical, spacing: 5)
+                let heading = record.draft.title.split(whereSeparator: \.isNewline).first
+                let title = label(heading.map(String.init) ?? record.draft.title, size: 13)
+                title.maximumNumberOfLines = 1
+                title.lineBreakMode = .byTruncatingTail
+                title.toolTip = String(record.draft.title.prefix(500))
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                row.addArrangedSubview(title)
+                let detail = label(historyDates.string(from: record.attemptedAt) + "  ·  " + record.destination.name,
+                                   size: 11, color: .secondaryLabelColor)
+                detail.lineBreakMode = .byTruncatingTail
+                detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                row.addArrangedSubview(detail)
+
+                let actions = stack(.horizontal, spacing: 8)
+                let preview = NSButton(title: "内容を表示…", target: self, action: #selector(showHistoryContent(_:)))
+                preview.identifier = NSUserInterfaceItemIdentifier(record.id.uuidString)
+                actions.addArrangedSubview(preview)
+                if record.result != .sent || record.notionURL != nil {
+                    let button = NSButton(title: "", target: self, action: #selector(historyAction(_:)))
+                    button.identifier = preview.identifier
+                    actions.addArrangedSubview(button)
+                    historyButtons.append((record, button))
+                } else {
+                    actions.addArrangedSubview(label("送信済み", size: 11, color: .secondaryLabelColor))
+                }
+                row.addArrangedSubview(actions)
+                historyRows.addArrangedSubview(row)
+                NSLayoutConstraint.activate([
+                    row.widthAnchor.constraint(equalTo: historyRows.widthAnchor),
+                    title.widthAnchor.constraint(equalTo: row.widthAnchor),
+                    detail.widthAnchor.constraint(equalTo: row.widthAnchor),
+                ])
+            }
+            renderedHistory = records
+        }
+        historyMessage.stringValue = state.historyFeedback ?? (records.isEmpty ? "送信履歴はまだありません。" : "")
+        historyMessage.isHidden = historyMessage.stringValue.isEmpty
+        for (record, button) in historyButtons {
+            let sending = state.sendingID == record.id
+            if sending {
+                button.title = "送信中…"
+            } else {
+                switch record.result {
+                case .sent: button.title = "送信済み · Notionで開く"
+                case .failed: button.title = "未送信 · 再送…"
+                case .uncertain: button.title = "結果を要確認…"
+                }
+            }
+            button.isEnabled = !sending && (record.result == .sent || state.canRetry(record) || record.notionURL != nil)
+        }
+    }
+
+    private func historyRecord(for sender: NSButton) -> SendRecord? {
+        guard let key = sender.identifier?.rawValue, let id = UUID(uuidString: key) else { return nil }
+        return state.recentSends.first { $0.id == id }
+    }
+
+    @objc private func showHistoryContent(_ sender: NSButton) {
+        guard let record = historyRecord(for: sender) else { return }
+        let alert = NSAlert()
+        alert.messageText = "送信内容"
+        alert.informativeText = record.destination.name + "  ·  " + record.result.label
+        alert.addButton(withTitle: "閉じる")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let body = NSTextView(frame: scroll.bounds)
+        body.isEditable = false
+        body.isSelectable = true
+        body.isRichText = false
+        body.font = .systemFont(ofSize: 13)
+        body.textContainerInset = NSSize(width: 8, height: 8)
+        body.autoresizingMask = [.width]
+        body.isVerticallyResizable = true
+        body.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        body.textContainer?.widthTracksTextView = true
+        let draft = record.draft
+        let links = (try? PagePayload.bodyBlocks(draft))?.compactMap(PagePayload.bookmarkURL(in:)).map(\.absoluteString) ?? []
+        let contents = draft.body.replacingOccurrences(of: "\u{fffc}", with: "")
+        let images = draft.images.isEmpty ? [] : ["添付画像（\(draft.images.count)枚）\n" + draft.images.map(\.name).joined(separator: "\n")]
+        body.string = ([draft.title, contents] + draft.urls.values.sorted() + links + images)
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        scroll.documentView = body
+        alert.accessoryView = scroll
+        alert.runModal()
+    }
+
+    @objc private func historyAction(_ sender: NSButton) {
+        guard let record = historyRecord(for: sender) else { return }
+        if record.result == .sent {
+            if let url = record.notionURL { NSWorkspace.shared.open(url) }
+            return
+        }
+        let uncertain = record.result == .uncertain
+        let retry = state.canRetry(record)
+        let alert = NSAlert()
+        alert.messageText = uncertain ? "Notionで保存結果を確認してください" : "元の保存先へ再送しますか？"
+        alert.informativeText = record.destination.name
+        if uncertain {
+            alert.informativeText += "\n\nNotionに同じページがあるか確認してください。途中まで保存されたページがある場合は、内容を確認して整理してから再送してください。"
+        }
+        alert.addButton(withTitle: "キャンセル")
+        if retry { alert.addButton(withTitle: uncertain ? "未保存を確認・再送" : "再送") }
+        if record.notionURL != nil { alert.addButton(withTitle: "Notionで確認") }
+        let result = alert.runModal()
+        if retry && result == .alertSecondButtonReturn {
+            Task { await state.retry(record.id, confirmedMissing: uncertain) }
+        } else if let url = record.notionURL,
+                  result == (retry ? .alertThirdButtonReturn : .alertSecondButtonReturn) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     private func linkButton(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.isBordered = false; button.contentTintColor = .linkColor; button.alignment = .left
@@ -253,6 +402,7 @@ import NotionWriterCore
     }
     func show() { update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil) }
     func update() {
+        updateHistory()
         connectButton.isEnabled = !state.busy && !state.syncing && !state.importingImages && !connecting
         database.isEnabled = connectButton.isEnabled
         token.isEnabled = connectButton.isEnabled
