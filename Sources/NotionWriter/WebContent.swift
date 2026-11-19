@@ -84,7 +84,7 @@ extension XMLElement {
 }
 
 extension String {
-    fileprivate var webText: String? {
+    var webText: String? {
         let value = split(whereSeparator: \.isWhitespace).joined(separator: " ")
         return value.isEmpty ? nil : value
     }

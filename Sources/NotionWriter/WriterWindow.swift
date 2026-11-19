@@ -84,6 +84,8 @@ final class WriterPanel: NSPanel {
     private var resettingDraft = false
     private var bodyLoadError: String?
     let imageButton = QuietButton(title: "画像を追加…", target: nil, action: nil)
+    private let articleButton = QuietButton(title: "記事を取り込む…", target: nil, action: nil)
+    private let articlePrompt = ArticleURLPrompt()
     let imageCount = label("", size: 11, color: .secondaryLabelColor)
     private let imageSizeWarning = label("5MB以上の画像が含まれています", size: 11,
                                          color: NSColor(srgbRed: 0.56, green: 0.31, blue: 0.08, alpha: 1))
@@ -139,7 +141,14 @@ final class WriterPanel: NSPanel {
         imageButton.isBordered = false; imageButton.contentTintColor = WriterStyle.muted; imageButton.target = self; imageButton.action = #selector(addImages)
         imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)
         imageButton.imagePosition = .imageLeading; imageButton.imageHugsTitle = true; imageButton.setAccessibilityLabel("画像を追加")
-        actions.addArrangedSubview(imageButton); actions.addArrangedSubview(imageCount)
+        actions.addArrangedSubview(imageButton)
+        articleButton.target = self
+        articleButton.action = #selector(addArticle)
+        articleButton.imagePosition = .imageLeading
+        articleButton.imageHugsTitle = true
+        articleButton.setAccessibilityLabel("記事を取り込む")
+        actions.addArrangedSubview(articleButton)
+        actions.addArrangedSubview(imageCount)
         imageCount.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         actions.addArrangedSubview(imageSizeWarning)
         root.addArrangedSubview(actions); actions.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
@@ -233,7 +242,9 @@ final class WriterPanel: NSPanel {
         window.isMovable = !state.display.fixedPosition
         window.isMovableByWindowBackground = !state.display.fixedPosition
         for editor in [titleEditor, bodyEditor] { editor.textContainerInset = NSSize(width: 0, height: 3 * scale) }
-        imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 12 * scale, weight: .regular))
+        let actionSymbol = NSImage.SymbolConfiguration(pointSize: 12 * scale, weight: .regular)
+        imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
+        articleButton.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         let footerFont = state.display.scaledFont(size: 11)
         for field in [status, destinationLabel, imageCount, imageSizeWarning] { field.font = footerFont }
         for button in [sendButton, pendingButton, clearButton] { button.font = footerFont }
@@ -369,7 +380,9 @@ final class WriterPanel: NSPanel {
             titleEditor.needsDisplay = true
             tagRows.forEach { $0.applyDisplay(state.display) }
             urlFields.forEach { $0.font = state.display.scaledFont(size: state.display.propertySize) }
-            bodyButton.font = state.display.scaledFont(size: state.display.propertySize); imageButton.font = bodyButton.font
+            bodyButton.font = state.display.scaledFont(size: state.display.propertySize)
+            imageButton.font = bodyButton.font
+            articleButton.font = bodyButton.font
             renderedDisplay = state.display
             fitContent()
             if needsPosition && state.display.fixedPosition && window?.isVisible == true { positionAtFixedLocation() }
@@ -384,6 +397,7 @@ final class WriterPanel: NSPanel {
         titleEditor.isEditable = !state.busy && !state.draft.submissionPending && !state.changingDestination
         bodyEditor.isEditable = titleEditor.isEditable && !state.importingImages && bodyLoadError == nil
         imageButton.isEnabled = bodyEditor.isEditable
+        articleButton.isEnabled = bodyEditor.isEditable
     }
 
     private func updateFooterActions() {
@@ -494,6 +508,19 @@ final class WriterPanel: NSPanel {
         Task { await state.addImageData(data) { try insertImages($0, at: caret) } }
     }
 
+    @objc private func addArticle() {
+        guard let window, window.attachedSheet == nil, bodyEditor.isEditable,
+              (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
+        tagRows.forEach { $0.collapse() }
+        articlePrompt.show(in: window) { [weak self] url in
+            guard let self else { return }
+            loadBodyDraft(force: true)
+            if bodyLoadError != nil { update(); return }
+            let end = NSRange(location: (bodyEditor.string as NSString).length, length: 0)
+            importWebContent(.article(url), replacing: end)
+        }
+    }
+
     private func importWebContent(_ source: WebClip.Source, replacing range: NSRange) {
         guard bodyEditor.isEditable, !bodyEditor.hasMarkedText() else { return }
         let previousBody = bodyEditor.string
@@ -510,12 +537,25 @@ final class WriterPanel: NSPanel {
                 guard bodyEditor.insertWebBlocks(fragment, replacing: range) else {
                     throw WriterError.validation("取り込んだ内容を本文に挿入できませんでした。")
                 }
-                if let title = content.title, state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    state.draft.title = title
-                    titleEditor.string = title
+                if case .article(let url) = source {
+                    fillArticleProperties(title: content.title, url: url)
                 }
                 fitContent()
             }
+        }
+    }
+
+    private func fillArticleProperties(title: String?, url: URL) {
+        if let title, !titleEditor.hasMarkedText(),
+           state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            state.draft.title = title
+            titleEditor.string = title
+        }
+        let properties = state.visibleSchema.urls
+        let property = properties.first { $0.name.caseInsensitiveCompare("URL") == .orderedSame }
+            ?? (properties.count == 1 ? properties.first : nil)
+        if let property, (state.draft.urls[property.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            state.draft.urls[property.id] = url.absoluteString
         }
     }
 

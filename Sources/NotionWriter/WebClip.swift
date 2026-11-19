@@ -31,9 +31,10 @@ enum WebClip {
             throw WriterError.validation("コピーした記事の書式を読み取れませんでした。")
         case .article(let url):
             let document = try await WebDocument.load(url)
-            let body = document.root.firstElement {
+            let noteBody = document.root.firstElement {
                 $0.value("class")?.split(separator: " ").contains("note-common-styles__textnote-body") == true
-            } ?? document.root.firstElement {
+            }
+            let body = noteBody ?? document.root.firstElement {
                 $0.value("data-writer-article") == "1" || $0.value("role") == "main"
             }
             guard let body else { throw WriterError.validation("記事本文を見つけられませんでした。ブラウザで本文を選択してコピーしてください。") }
@@ -43,8 +44,15 @@ enum WebClip {
                 .block(PagePayload.bookmark(document.base ?? url)),
                 .block(block("paragraph", runs: []))
             ]
-            return (document.title(), header + content)
+            let heading = noteBody == nil ? nil : document.root.firstElement { $0.name == "h1" }
+            let title = heading?.stringValue?.webText ?? document.title()
+            return (title.map(bracketedTitle), header + content)
         }
+    }
+
+    private static func bracketedTitle(_ title: String) -> String {
+        if title.hasPrefix("【"), title.hasSuffix("】") { return title }
+        return "【" + title + "】"
     }
 
     static func parts(in body: XMLElement, base: URL?) -> [Part] {
