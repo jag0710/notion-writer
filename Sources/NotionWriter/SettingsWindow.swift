@@ -26,7 +26,6 @@ import NotionWriterCore
     var sizeLabels: [String: NSTextField] = [:]
     var shortcutChanged: ((Shortcut) -> String?)?
     private let tabs = NSTabView()
-    private let bookmarkModeButton = NSPopUpButton()
     private let historyLimitButton = NSPopUpButton()
     private let historyRows = stack(.vertical, spacing: 14)
     private let aiStudioDetail = label("", size: 12, color: .secondaryLabelColor)
@@ -59,10 +58,10 @@ import NotionWriterCore
             window.contentView!.heightAnchor.constraint(greaterThanOrEqualToConstant: 560)
         ])
         buildConnectionTab(addTab("Notionへの接続", to: tabs, scrollable: true))
+        buildImportTab(addTab("取り込み全般", to: tabs, scrollable: true))
         buildDisplayTab(addTab("表示", to: tabs))
         buildGeneralTab(addTab("一般", to: tabs))
         buildHistoryTab(addTab("履歴", to: tabs, scrollable: true))
-        buildConversationTab(addTab("対話取り込み", to: tabs))
         tabs.delegate = self
         window.setContentSize(NSSize(width: 580, height: 560)); window.center(); update()
     }
@@ -101,13 +100,21 @@ import NotionWriterCore
         field.setContentCompressionResistancePriority(.required, for: .vertical)
         root.addArrangedSubview(field); field.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
     }
-    private func buildConversationTab(_ root: NSStackView) {
-        root.addArrangedSubview(label("Google AI Studio", size: 16))
+    private func buildImportTab(_ root: NSStackView) {
+        root.addArrangedSubview(label("対話取り込み", size: 16))
+        explain("対話URLから取得できないときは、ブラウザで内容をコピーして取り込めます。", in: root)
         root.addArrangedSubview(aiStudioDetail)
-        explain("アプリでは、最初に対話URLを入力したときに選んだGoogle Driveの対話ファイルを読み取ります。Googleアカウントのログインはブラウザで行います。", in: root)
         disconnectAIStudioButton.target = self
         disconnectAIStudioButton.action = #selector(disconnectAIStudio)
         root.addArrangedSubview(disconnectAIStudioButton)
+        root.setCustomSpacing(24, after: disconnectAIStudioButton)
+
+        root.addArrangedSubview(label("記事取り込み", size: 16))
+        explain("記事のURLを本文の先頭にテキストとして追加します。", in: root)
+        if let detail = root.arrangedSubviews.last { root.setCustomSpacing(24, after: detail) }
+
+        root.addArrangedSubview(label("全文取り込み", size: 16))
+        explain("コピーした文章を発言の区切り、見出し、段落、出典を保って追加します。", in: root)
     }
 
     @objc private func disconnectAIStudio() {
@@ -392,18 +399,6 @@ import NotionWriterCore
         sizeSliders[id] = slider; sizeLabels[id] = value
     }
     private func buildGeneralTab(_ root: NSStackView) {
-        root.addArrangedSubview(label("Notionに送るブックマーク", size: 16))
-        for mode in PagePayload.BookmarkMode.allCases {
-            let title = mode == .urlOnly ? "URLだけ貼る" : "サムネイル付きカード"
-            bookmarkModeButton.addItem(withTitle: title)
-            bookmarkModeButton.lastItem?.representedObject = mode.rawValue
-        }
-        bookmarkModeButton.setAccessibilityLabel("Notionに送るブックマーク")
-        bookmarkModeButton.target = self
-        bookmarkModeButton.action = #selector(bookmarkModeChanged(_:))
-        root.addArrangedSubview(bookmarkModeButton)
-        explain("本文に入れたブックマークに、Notionへの送信時に適用します。", in: root)
-
         root.addArrangedSubview(label("キーボードショートカット", size: 16))
         let openRecorder = ShortcutRecorder(shortcut: .load())
         let clearRecorder = ShortcutRecorder(shortcut: state.clearShortcut)
@@ -464,20 +459,10 @@ import NotionWriterCore
         shortcutMessage.isHidden = warning == nil
     }
     func show() { update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil) }
-    @objc private func bookmarkModeChanged(_ sender: NSPopUpButton) {
-        guard let value = sender.selectedItem?.representedObject as? String,
-              let mode = PagePayload.BookmarkMode(rawValue: value) else { return }
-        state.setBookmarkMode(mode)
-    }
-
     func update() {
         if tabs.selectedTabViewItem?.identifier as? String == "履歴" { updateHistory() }
-        let bookmarkModeIndex = bookmarkModeButton.itemArray.firstIndex {
-            $0.representedObject as? String == state.bookmarkMode.rawValue
-        }
-        if let bookmarkModeIndex { bookmarkModeButton.selectItem(at: bookmarkModeIndex) }
         let fileCount = state.aiStudioFileCount
-        aiStudioDetail.stringValue = fileCount == 0 ? "接続しているファイルはありません。" : "接続済みの対話ファイル  \(fileCount)件"
+        aiStudioDetail.stringValue = "Google AI Studioの登録済みファイル  \(fileCount)件"
         disconnectAIStudioButton.isEnabled = fileCount > 0 && !state.importingImages
         connectButton.isEnabled = !state.busy && !state.syncing && !state.importingImages && !connecting
         database.isEnabled = connectButton.isEnabled

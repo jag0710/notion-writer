@@ -2,12 +2,10 @@ import AppKit
 import NotionWriterCore
 
 @MainActor final class AppState {
-    private static let bookmarkModeKey = "notionBookmarkMode"
     private static let historyLimitKey = "sendHistoryLimit"
 
     let store: LocalStore
     private let preferences: UserDefaults
-    private(set) var bookmarkMode: PagePayload.BookmarkMode
     private(set) var historyLimit: Int
     private(set) var activeDestination: NotionDestination?
     var connection: Connection? { activeDestination?.connection }
@@ -23,7 +21,6 @@ import NotionWriterCore
     var submissionStarted: (() -> Void)?
     var saved: (() -> Void)?
     var submissionFailed: (() -> Void)?
-    private let bookmarkPreview: @Sendable (URL) async -> BookmarkPreview?
     private(set) var recentSends: [SendRecord]
     private(set) var sendingID: UUID?
     private(set) var historyFeedback: String?
@@ -41,13 +38,10 @@ import NotionWriterCore
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
     init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil,
-         preferences: UserDefaults = .standard,
-         bookmarkPreview: @escaping @Sendable (URL) async -> BookmarkPreview? = { await BookmarkPreviews.shared.load($0) }) throws {
+         preferences: UserDefaults = .standard) throws {
         self.clientOverride = clientOverride
-        self.bookmarkPreview = bookmarkPreview
         self.qa = qa
         self.preferences = preferences
-        bookmarkMode = preferences.string(forKey: Self.bookmarkModeKey).flatMap(PagePayload.BookmarkMode.init(rawValue:)) ?? .richCard
         let savedLimit = preferences.integer(forKey: Self.historyLimitKey)
         historyLimit = SendRecord.limits.contains(savedLimit) ? savedLimit : SendRecord.defaultLimit
         let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Notion Writer"
@@ -71,12 +65,6 @@ import NotionWriterCore
         if draft.submissionPending { status = pendingSaveMessage }
         else if let target = activeDestination { status = target.name + " · キャッシュを表示中" }
     }
-    func setBookmarkMode(_ mode: PagePayload.BookmarkMode) {
-        bookmarkMode = mode
-        preferences.set(mode.rawValue, forKey: Self.bookmarkModeKey)
-        updated?()
-    }
-
     func setHistoryLimit(_ limit: Int) throws {
         guard !busy, SendRecord.limits.contains(limit), limit != historyLimit else { return }
         if recentSends.count > limit {
@@ -242,7 +230,6 @@ import NotionWriterCore
 
     private func deliver(_ source: SendRecord, to target: NotionDestination, tracksEditor: Bool,
                          fromHistory: Bool = false, onAccepted: (() -> Void)? = nil) async {
-        let mode = bookmarkMode
         var record = source
         var accepted = false
         defer {
@@ -254,7 +241,7 @@ import NotionWriterCore
         }
         do {
             guard Date() >= retryNotBefore else { throw WriterError.validation("Notionの待機時間が終わってから送信してください。") }
-            let blocks = try PagePayload.bodyWithImages(record.draft)
+            _ = try PagePayload.bodyWithImages(record.draft)
             guard !record.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw WriterError.validation("文章を入力してください。")
             }
@@ -279,12 +266,10 @@ import NotionWriterCore
             let placeholder = "00000000-0000-0000-0000-000000000000"
             let placeholders = Dictionary(record.draft.images.map { ($0.id, placeholder) }, uniquingKeysWith: { first, _ in first })
             _ = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: placeholders,
-                                        bookmarkMode: mode, destination: target)
+                                        destination: target)
 
-            let bookmarkURLs = mode == .richCard ? blocks.compactMap(PagePayload.bookmarkURL(in:)) : []
-            let previews = try await prepareBookmarks(bookmarkURLs, using: api)
             var uploadedImages: [String: String] = [:]
-            var uploadedDuringSave = previews.values.contains { $0.thumbnailUploadID != nil }
+            var uploadedDuringSave = false
             for index in record.draft.images.indices {
                 let image = record.draft.images[index]
                 if let id = image.reusableUploadID() {
@@ -304,7 +289,7 @@ import NotionWriterCore
             }
             if uploadedDuringSave { fresh = try await api.fetchSchema(destination: target) }
             let delivery = try PagePayload.prepare(draft: record.draft, schema: fresh, uploadedImages: uploadedImages,
-                                                   bookmarkMode: mode, bookmarkPreviews: previews, destination: target)
+                                                   destination: target)
             status = "ページを保存中…"
             updated?()
             try store.write(fresh, name: cacheName(connection))
@@ -355,41 +340,6 @@ import NotionWriterCore
         }
     }
 
-    private func prepareBookmarks(_ urls: [URL], using api: NotionClient) async throws -> [URL: PagePayload.BookmarkPreview] {
-        var seen = Set<URL>()
-        let unique = urls.filter { seen.insert($0).inserted }
-        var results: [URL: PagePayload.BookmarkPreview] = [:]
-        guard !unique.isEmpty else { return results }
-        status = "ブックマークを準備中…"
-        updated?()
-        let load = bookmarkPreview
-        for start in stride(from: 0, to: unique.count, by: 4) {
-            let batch = unique[start..<min(start + 4, unique.count)]
-            let previews = await withTaskGroup(of: (URL, BookmarkPreview?).self) { group in
-                for url in batch { group.addTask { (url, await load(url)) } }
-                var previews: [URL: BookmarkPreview] = [:]
-                for await (url, preview) in group { previews[url] = preview }
-                return previews
-            }
-            for url in batch {
-                guard let preview = previews[url] else { continue }
-                var uploadID: String?
-                if let thumbnail = preview.thumbnail {
-                    do {
-                        uploadID = try await api.uploadImage(data: thumbnail, filename: "bookmark-thumbnail.jpg", contentType: "image/jpeg")
-                    } catch {
-                        if case WriterError.api(429, _, let retry) = error {
-                            // A thumbnail is optional. Honor Retry-After before sending the page.
-                            guard let retry, (0...10).contains(retry) else { throw error }
-                            try await Task.sleep(for: .seconds(retry))
-                        }
-                    }
-                }
-                results[url] = .init(title: preview.title, summary: preview.summary, thumbnailUploadID: uploadID)
-            }
-        }
-        return results
-    }
     var pendingSaveMessage: String {
         if recentSends.contains(where: { $0.id == draft.submissionID && $0.result == .sent }) {
             return "Notionへの送信は完了しています。「保存結果を確認…」から下書きを閉じられます。"

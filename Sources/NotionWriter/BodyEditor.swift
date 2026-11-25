@@ -72,9 +72,7 @@ final class BodyEditor: WriterTextView {
         dismissCommands()
         var attributes = normalAttributes.merging(block) { _, new in new }
         attributes[.font] = activeFont
-        var linkAttributes = attributes
-        linkAttributes[.link] = url
-        let link = NSAttributedString(string: url.absoluteString, attributes: linkAttributes)
+        let link = NSAttributedString(string: url.absoluteString, attributes: attributes)
         guard replace(range, with: link) else { return false }
         typingAttributes = attributes
 
@@ -82,23 +80,12 @@ final class BodyEditor: WriterTextView {
             let pasted = NSRange(location: range.location, length: link.length)
             commands.showURLPaste(in: self) { [weak self] action in
                 switch action {
-                case .bookmark: self?.makeBookmark(url, replacing: pasted)
                 case .clipArticle: self?.importWebContent?(.article(url), pasted)
                 default: break
                 }
             }
         }
         return true
-    }
-
-    @discardableResult
-    func makeBookmark(_ url: URL, replacing pasted: NSRange) -> Bool {
-        guard !hasMarkedText(), let storage = textStorage else { return false }
-        let text = storage.string as NSString
-        let end = NSMaxRange(pasted)
-        guard end <= text.length, text.substring(with: pasted) == url.absoluteString else { return false }
-
-        return insertWebBlocks(BodyBookmarkAttachment.fragment(url, font: baseFont), replacing: pasted)
     }
 
     @discardableResult
@@ -118,15 +105,7 @@ final class BodyEditor: WriterTextView {
         if end < text.length, text.character(at: end) == 10 { range.length += 1 }
         guard replace(range, with: fragment) else { return false }
         typingAttributes = normalAttributes
-        refreshBookmarkPreviews()
         return true
-    }
-
-    func refreshBookmarkPreviews() {
-        guard let storage = textStorage else { return }
-        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
-            (value as? BodyBookmarkAttachment)?.loadPreview(in: self)
-        }
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -288,7 +267,7 @@ final class BodyEditor: WriterTextView {
 
     private func hasStandaloneAttachment(at position: Int, in storage: NSAttributedString) -> Bool {
         let attachment = storage.attribute(.attachment, at: position, effectiveRange: nil)
-        return attachment is BodyImageAttachment || attachment is BodyBookmarkAttachment
+        return attachment is BodyImageAttachment
     }
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
@@ -473,7 +452,7 @@ final class BodyEditor: WriterTextView {
             switch action {
             case .block(let kind): self?.apply(kind, replacing: range)
             case .color(let color): self?.applyColor(color, replacing: range)
-            case .bookmark, .keepURL, .clipArticle: break
+            case .keepURL, .clipArticle: break
             }
         }
     }

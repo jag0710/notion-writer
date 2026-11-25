@@ -21,9 +21,6 @@ enum BodyDocument {
                 let image = attachment.draftImage
                 blocks.append(PagePayload.imageReference(image.id))
                 if ids.insert(image.id).inserted { images.append(image) }
-            } else if let attachment = value as? BodyBookmarkAttachment {
-                appendText(until: range.location)
-                blocks.append(PagePayload.bookmark(attachment.url))
             } else {
                 return
             }

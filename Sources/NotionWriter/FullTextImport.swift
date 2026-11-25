@@ -12,7 +12,7 @@ enum FullTextImport {
     private static let headingPattern = #"^([0-9]+)\\?\. (?=\S)"#
     private static let sourceCountPattern = #"^\+[0-9]+$"#
 
-    static func transcript(_ text: String) throws -> Transcript {
+    static func transcript(_ text: String, assistantRole: String = "ai") throws -> Transcript {
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         var lines = normalized.trimmingCharacters(in: .newlines).components(separatedBy: "\n")
         if lines.first?.trimmingCharacters(in: .whitespaces) == skipNavigation + "\\", lines.contains("\\") {
@@ -26,7 +26,7 @@ enum FullTextImport {
         let prose = proseFlags(lines)
         let hasGoogleFooter = lines.indices.contains { prose[$0] && trim(lines[$0]) == answerFooters[0] }
         if !isFullPage && !hasGoogleFooter {
-            let turns = labeledTurns(lines, prose: prose) ?? [
+            let turns = labeledTurns(lines, prose: prose, assistantRole: assistantRole) ?? [
                 .init(speaker: "text", markdown: lines.joined(separator: "\n"))
             ]
             guard turns.contains(where: { !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
@@ -58,10 +58,7 @@ enum FullTextImport {
                 if let sources = readSources(from: index + 1, in: lines, prose: prose, isFullPage: isFullPage) {
                     let body = formatAnswer(lines[start..<index], prose: prose, isFullPage: isFullPage,
                                             sourceNames: Set(sources.cards.map { $0[0] }))
-                    let entries = sources.cards.map { card in
-                        (["- \(card[0]) — \(card[1])"] + card.dropFirst(2)).joined(separator: "\n")
-                    }.joined(separator: "\n\n")
-                    appendResponse([body, "### 出典", entries].filter { !$0.isEmpty }.joined(separator: "\n\n"), to: &turns)
+                    appendResponse(body, sourceCards: sources.cards, to: &turns)
                     index = sources.end
                     answerStart = nil
                     continue
@@ -85,9 +82,9 @@ enum FullTextImport {
         source.trimmingCharacters(in: .whitespaces)
     }
 
-    private static func appendResponse(_ markdown: String, to turns: inout [Transcript.Turn]) {
-        if !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            turns.append(.init(speaker: "ai", markdown: markdown))
+    private static func appendResponse(_ markdown: String, sourceCards: [[String]] = [], to turns: inout [Transcript.Turn]) {
+        if !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !sourceCards.isEmpty {
+            turns.append(.init(speaker: "ai", markdown: markdown, sourceCards: sourceCards))
         }
     }
 
@@ -169,9 +166,9 @@ enum FullTextImport {
         return output.joined(separator: "\n").trimmingCharacters(in: .newlines)
     }
 
-    private static func labeledTurns(_ lines: [String], prose: [Bool]) -> [Transcript.Turn]? {
+    private static func labeledTurns(_ lines: [String], prose: [Bool], assistantRole: String) -> [Transcript.Turn]? {
         let userLabels = ["あなた", "ユーザー", "user", "you", "you said", "あなたの発言", "質問"]
-        let aiLabels = ["assistant", "ai", "アシスタント", "回答", "chatgpt", "chatgpt said", "claude", "gemini", "google ai モード"]
+        let aiLabels = ["assistant", "ai", "アシスタント", "回答", "chatgpt", "chatgpt said", "claude", "gemini", "model", "モデル", "google ai studio", "google ai モード"]
         var headings: [(index: Int, speaker: String, body: String)] = []
         for index in lines.indices where prose[index] {
             var label = trim(lines[index])
@@ -187,12 +184,12 @@ enum FullTextImport {
             let boundary = label.firstIndex { $0 == ":" || $0 == "：" } ?? label.endIndex
             let name = trim(String(label[..<boundary])).lowercased()
             guard userLabels.contains(name) || aiLabels.contains(name) else { continue }
-            let speaker = userLabels.contains(name) ? "user" : "ai"
+            let speaker = userLabels.contains(name) ? "user" : assistantRole
             let body = boundary == label.endIndex ? "" : trim(String(label[label.index(after: boundary)...]))
             headings.append((index, speaker, body))
         }
         guard let first = headings.first, first.speaker == "user",
-              headings.contains(where: { $0.speaker == "ai" }) else { return nil }
+              headings.contains(where: { $0.speaker == assistantRole }) else { return nil }
         let preamble = lines[..<first.index].joined(separator: "\n").trimmingCharacters(in: .newlines)
         var turns: [Transcript.Turn] = preamble.isEmpty ? [] : [.init(speaker: "text", markdown: preamble)]
         for (offset, heading) in headings.enumerated() {

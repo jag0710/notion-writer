@@ -10,19 +10,19 @@ extension AppVerification {
         await state.sync()
         let writer = WriterWindow(state: state)
         let window = writer.window!
-        let buttons = ["画像を追加…", "記事を取り込む…", "対話を取り込む…", "全文を取り込む…"]
+        let buttons = ["本文を追加", "画像を追加", "記事を取り込む", "対話を取り込む", "全文を取り込む"]
         func containsActionRow(_ view: NSView) -> Bool {
             if let row = view as? NSStackView, row.orientation == .horizontal {
                 let labels = row.arrangedSubviews.compactMap { ($0 as? NSButton)?.title }
-                if buttons.dropFirst().allSatisfy(labels.contains) && labels.contains(where: { $0.hasPrefix("画像を追加") }) { return true }
+                if Array(labels.prefix(buttons.count)) == buttons { return true }
             }
             return view.subviews.contains(where: containsActionRow)
         }
         try require(window.contentView.map(containsActionRow) == true, "Import actions are not on the same toolbar")
         let settings = SettingsWindow(state: state)
         let tabs = settings.window?.contentView?.subviews.compactMap { $0 as? NSTabView }.first
-        try require(tabs?.tabViewItems.map(\.label).contains("Notionへの接続") == true &&
-                    tabs?.tabViewItems.map(\.label).contains("対話取り込み") == true, "Connection tab labels are missing")
+        try require(tabs?.tabViewItems.prefix(2).map(\.label) == ["Notionへの接続", "取り込み全般"],
+                    "The import settings are not next to the Notion connection tab")
 
         state.draft.title = "既存タイトル"
         state.draft.urls = ["other": "https://example.com/other", "url": "https://example.com/previous"]
@@ -47,6 +47,18 @@ extension AppVerification {
         try require(imported && state.draft.title == "既存タイトル" &&
                     state.draft.urls == ["other": "https://example.com/other", "url": shared.absoluteString], "Import changed title or the unrelated URL")
         let current = writer.bodyEditor.string
+        func headingsHavePrototypeSpacing(_ editor: NSTextView) -> Bool {
+            let range = (editor.string as NSString).range(of: "ChatGPT")
+            guard range.location != NSNotFound,
+                  let style = editor.textStorage?.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle else { return false }
+            return abs(style.paragraphSpacingBefore - 17 * writer.bodyEditor.baseFont.pointSize / 15) < 0.01
+        }
+        try require(headingsHavePrototypeSpacing(writer.bodyEditor) && state.draft.usesTranscriptLayout,
+                    "The imported headings lost the prototype spacing")
+        let reopened = try Self.state(root: location)
+        let reopenedWriter = WriterWindow(state: reopened)
+        reopenedWriter.toggleBody()
+        try require(headingsHavePrototypeSpacing(reopenedWriter.bodyEditor), "Reopening the draft lost the transcript layout")
         let order = ["既存メモ", "元の項目", "あなた", "質問の本文", "ChatGPT", "元の見出し", "一番目", "二番目"]
         try require(containsInOrder(current, order), "Preview order or Markdown structure was lost")
         try require(current.contains("画像の説明") && current.contains("投票の質問") && current.contains("選択肢A") &&
@@ -80,11 +92,21 @@ extension AppVerification {
                     properties?["other"]?["url"] as? String == "https://example.com/other" &&
                     links.contains("https://example.com/source"),
                     "Notion request lost the bookmark-free URL, paragraph breaks, links, or ordered content")
-        print("PASS: the AppKit editor imports, appends and sends conversations, and preserves the draft on cancellation or failure")
+        let privateURL = URL(string: "https://chatgpt.com/c/" + id)!
+        let aiURL = URL(string: "https://aistudio.google.com/prompts/abcdef12345")!
+        let privateBrowser = await writer.importConversation(.fullText("You said: 質問\nChatGPT said: 回答", sourceURL: privateURL))
+        try require(privateBrowser && state.draft.urls["url"] == privateURL.absoluteString &&
+                    containsInOrder(writer.bodyEditor.string, ["あなた", "質問", "ChatGPT", "回答"]),
+                    "Browser copy lost the private ChatGPT link or speaker")
+        let aiBrowser = await writer.importConversation(.fullText("User:\n問い\nModel:\n答え", sourceURL: aiURL))
+        try require(aiBrowser && state.draft.urls["url"] == aiURL.absoluteString &&
+                    containsInOrder(writer.bodyEditor.string, ["あなた", "問い", "Google AI Studio", "答え"]),
+                    "The file-free AI Studio flow lost the origin or speaker")
+        print("PASS: AppKit import, preview spacing, browser copy, URL preservation and cancellation")
     }
 
     @MainActor static func verifyConversationSamples(_ args: [String], root: URL) async throws {
-        guard args.count == 5, let share = URL(string: args[0]), let personal = URL(string: args[1]),
+        guard (5...6).contains(args.count), let share = URL(string: args[0]), let personal = URL(string: args[1]),
               let aiStudio = URL(string: args[2]) else {
             throw CheckFailure.failed("Supply a shared URL, private URL, AI Studio URL, AI Studio file and full-page text")
         }
@@ -179,7 +201,16 @@ extension AppVerification {
                     containsInOrder(preview, ["あなた", "AI", "あなた", "AI", "BBCニュース"]) &&
                     !searchText.contains("メイン コンテンツにスキップ") && !searchText.contains("AI モードの回答が作成されました"),
                     "Google Search copy lost turns, inline sources, source cards or removed the wrong lines")
-        print("PASS: specified full-page Google Search copy retained two exchanges, 13 inline citations, and six source cards in preview and outgoing data")
+        try require(sourceCards.allSatisfy { block in conversationText([block]).contains("\n") },
+                    "A source card lost its excerpt or the excerpt was separated from its title")
+        if args.count == 6 {
+            let approved = try String(contentsOfFile: args[5], encoding: .utf8)
+            let prototypeText = conversationText(try MarkdownBody.blocks(approved))
+            func words(_ value: String) -> [Substring] { value.split(whereSeparator: \.isWhitespace) }
+            try require(words(conversationText(Array(searchBlocks.dropFirst()))) == words(prototypeText),
+                        "The full sample changed text or order compared with the approved prototype")
+        }
+        print("PASS: full Google Search sample matches the prototype text; two exchanges, 13 inline citations and six grouped source cards")
     }
 
     private static func sharedConversationFixture() throws -> String {

@@ -85,8 +85,20 @@ public enum PagePayload {
         return bookmarkURL(source)
     }
 
-    public static func bookmark(_ url: URL) -> [String: Any] {
-        ["object": "block", "type": "bookmark", "bookmark": ["url": url.absoluteString]]
+    public static func urlText(_ url: URL) -> [String: Any] {
+        let text = ["type": "text", "text": ["content": url.absoluteString]] as [String: Any]
+        return ["object": "block", "type": "paragraph", "paragraph": ["rich_text": [text]]]
+    }
+
+    public static func replacingLegacyBookmark(_ block: [String: Any]) -> [String: Any] {
+        guard let url = bookmarkURL(in: block) else { return block }
+        let plain = urlText(url)
+        let bookmark = block["bookmark"] as? [String: Any]
+        guard let caption = bookmark?["caption"] as? [[String: Any]], !caption.isEmpty,
+              let paragraph = plain["paragraph"] as? [String: Any],
+              let address = paragraph["rich_text"] as? [[String: Any]] else { return plain }
+        let newline: [String: Any] = ["type": "text", "text": ["content": "\n"]]
+        return ["object": "block", "type": "paragraph", "paragraph": ["rich_text": address + [newline] + caption]]
     }
 
     public static func imageReference(_ id: String) -> [String: Any] {
@@ -118,42 +130,6 @@ public enum PagePayload {
         return delivery.create
     }
 
-    public enum BookmarkMode: String, CaseIterable, Sendable {
-        case urlOnly, richCard
-    }
-
-    public struct BookmarkPreview: Sendable {
-        public let title: String
-        public let summary: String?
-        public let thumbnailUploadID: String?
-
-        public init(title: String, summary: String?, thumbnailUploadID: String?) {
-            self.title = title
-            self.summary = summary
-            self.thumbnailUploadID = thumbnailUploadID
-        }
-    }
-
-    private static func bookmarkBlock(_ original: [String: Any], url: URL, preview: BookmarkPreview) -> [String: Any] {
-        let title = String(preview.title.prefix(300))
-        let label = chunks(title.isEmpty ? (url.host ?? url.absoluteString) : title).map {
-            ["type": "text", "text": ["content": $0, "link": ["url": url.absoluteString]], "annotations": ["bold": true]] as [String: Any]
-        }
-        guard let uploadID = preview.thumbnailUploadID, UUID(uuidString: uploadID) != nil else {
-            var content = original["bookmark"] as? [String: Any] ?? [:]
-            if content["caption"] == nil && !title.isEmpty { content["caption"] = label }
-            return ["object": "block", "type": "bookmark", "bookmark": content]
-        }
-        let image = uploadedImage(uploadID)
-        var text = label
-        if let summary = preview.summary, !summary.isEmpty {
-            text += chunks("\n" + String(summary.prefix(400))).map { ["type": "text", "text": ["content": $0]] }
-        }
-        return ["object": "block", "type": "callout", "callout": [
-            "rich_text": text, "icon": ["type": "emoji", "emoji": "🔗"], "color": "gray_background", "children": [image]
-        ]]
-    }
-
     private static func uploadedImage(_ id: String) -> [String: Any] {
         ["object": "block", "type": "image", "image": ["type": "file_upload", "file_upload": ["id": id]]]
     }
@@ -164,7 +140,6 @@ public enum PagePayload {
     }
 
     public static func prepare(draft: Draft, schema: Schema, uploadedImages: [String: String] = [:],
-                               bookmarkMode: BookmarkMode = .richCard, bookmarkPreviews: [URL: BookmarkPreview] = [:],
                                destination: NotionDestination) throws -> Delivery {
         try destination.validate(schema)
         guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WriterError.validation("文章を入力してください。") }
@@ -187,15 +162,7 @@ public enum PagePayload {
         let body: [String: Any] = ["parent": ["type": "data_source_id", "data_source_id": schema.dataSourceID], "properties": properties]
         let images = Set(draft.images.map(\.id))
         let children = try bodyWithImages(draft).map { block in
-            if let url = bookmarkURL(in: block) {
-                if bookmarkMode == .urlOnly {
-                    let address = url.absoluteString
-                    let text: [String: Any] = ["type": "text", "text": ["content": address, "link": ["url": address]]]
-                    return ["object": "block", "type": "paragraph", "paragraph": ["rich_text": [text]]]
-                }
-                if let preview = bookmarkPreviews[url] { return bookmarkBlock(block, url: url, preview: preview) }
-            }
-            guard let imageID = imageReferenceID(block) else { return block }
+            guard let imageID = imageReferenceID(block) else { return replacingLegacyBookmark(block) }
             guard images.contains(imageID), let uploadID = uploadedImages[imageID], UUID(uuidString: uploadID) != nil else {
                 throw WriterError.validation("画像の送信が完了していません。下書きは保持しています。")
             }

@@ -4,7 +4,7 @@ import NotionWriterCore
 enum ConversationImport {
     enum Source: Sendable {
         case url(URL)
-        case fullText(String)
+        case fullText(String, sourceURL: URL? = nil)
         case aiStudio(url: URL, file: URL, remember: Bool)
     }
 
@@ -22,16 +22,22 @@ enum ConversationImport {
         case .url(let original):
             let link = try ConversationLink(original)
             if case .aiStudio = link {
-                throw WriterError.validation("Google AI Studioの対話ファイルを選んでください。ブラウザでコピーして「全文を取り込む…」も使えます。")
+                throw WriterError.validation("ブラウザでGoogle AI Studioの対話を開き、「全文を取り込む」に貼り付けてください。")
             }
             transcript = try await loadChat(link)
             url = original
-        case .fullText(let text):
+        case .fullText(let text, let sourceURL):
             guard text.utf8.count <= 10 * 1024 * 1024 else {
                 throw WriterError.validation("貼り付ける内容を分けて、もう一度取り込んでください。")
             }
-            transcript = try FullTextImport.transcript(text)
-            url = nil
+            let role: String
+            switch sourceURL.flatMap({ try? ConversationLink($0) }) {
+            case .chatGPTPrivate, .chatGPTShared: role = "assistant"
+            case .aiStudio: role = "model"
+            case nil: role = "ai"
+            }
+            transcript = try FullTextImport.transcript(text, assistantRole: role)
+            url = sourceURL
         case .aiStudio(let original, let file, let remember):
             guard case .aiStudio(let id) = try ConversationLink(original) else {
                 throw WriterError.validation("Google AI Studioの対話URLを確認してください。")
@@ -75,7 +81,7 @@ enum AIStudioAccess {
     static func read(file: URL) throws -> Transcript {
         let access = file.startAccessingSecurityScopedResource()
         defer { if access { file.stopAccessingSecurityScopedResource() } }
-        let invalid = WriterError.validation("Google AI Studioの対話データを読み取れませんでした。Google Driveに保存された対話ファイルを選び直すか、「全文を取り込む…」を使ってください。")
+        let invalid = WriterError.validation("Google AI Studioの対話データを読み取れませんでした。Google Driveに保存された対話ファイルを選び直すか、「全文を取り込む」を使ってください。")
         guard file.isFileURL, (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
               let handle = try? FileHandle(forReadingFrom: file) else { throw invalid }
         defer { try? handle.close() }

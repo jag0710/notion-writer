@@ -4,7 +4,6 @@ final class BodyCommandMenu: NSObject {
     enum Action: Equatable {
         case block(String)
         case color(String)
-        case bookmark
         case keepURL
         case clipArticle
     }
@@ -66,7 +65,6 @@ final class BodyCommandMenu: NSObject {
 
     func showURLPaste(in editor: NSTextView, onChoose: @escaping (Action) -> Void) {
         show([
-            Command(title: "ブックマークを作成", action: .bookmark, keywords: ""),
             Command(title: "URLのまま", action: .keepURL, keywords: ""),
             Command(title: "記事を取り込む", action: .clipArticle, keywords: ""),
         ], in: editor, onChoose: onChoose)

@@ -67,11 +67,10 @@ final class WriterPanel: NSPanel {
     let bodyEditor = BodyEditor()
     let properties = stack(.vertical, spacing: 0)
     let status = label("", size: 11, color: .secondaryLabelColor)
-    private let destinationLabel = label("", size: 11, color: .secondaryLabelColor)
     private let sendButton = NSButton(title: "送信", target: nil, action: nil)
     private let clearButton = NSButton(title: "入力をクリア", target: nil, action: nil)
     let pendingButton = NSButton(title: "保存結果を確認…", target: nil, action: nil)
-    let bodyButton = QuietButton(title: "▸ 本文を追加", target: nil, action: nil)
+    let bodyButton = QuietButton(title: "本文を追加", target: nil, action: nil)
     let bodyScroll = NSScrollView()
     private var bodyExpanded = false
     private var bodyHeight: NSLayoutConstraint!
@@ -83,12 +82,12 @@ final class WriterPanel: NSPanel {
     private var loadedDraftRevision = 0
     private var resettingDraft = false
     private var bodyLoadError: String?
-    let imageButton = QuietButton(title: "画像を追加…", target: nil, action: nil)
-    private let articleButton = QuietButton(title: "記事を取り込む…", target: nil, action: nil)
-    private let conversationButton = QuietButton(title: "対話を取り込む…", target: nil, action: nil)
-    private let fullTextButton = QuietButton(title: "全文を取り込む…", target: nil, action: nil)
+    let imageButton = QuietButton(title: "画像を追加", target: nil, action: nil)
+    private let articleButton = QuietButton(title: "記事を取り込む", target: nil, action: nil)
+    private let conversationButton = QuietButton(title: "対話を取り込む", target: nil, action: nil)
+    private let fullTextButton = QuietButton(title: "全文を取り込む", target: nil, action: nil)
     private lazy var articlePrompt = ImportURLPrompt(title: "記事を取り込む", instruction: "公開記事のURLを入力してください。", fieldLabel: "記事のURL")
-    private lazy var conversationPrompt = ImportURLPrompt(title: "対話を取り込む", instruction: "ChatGPTまたはGoogle AI Studioの対話URLを貼り付けてください。", fieldLabel: "対話のURL")
+    private lazy var conversationPrompt = ImportURLPrompt(title: "対話を取り込む", instruction: "URLを貼り付けて下さい", fieldLabel: "対話のURL")
     private lazy var fullTextPrompt = FullTextPrompt()
     let imageCount = label("", size: 11, color: .secondaryLabelColor)
     private let imageSizeWarning = label("5MB以上の画像が含まれています", size: 11,
@@ -139,26 +138,14 @@ final class WriterPanel: NSPanel {
         propertyHeight = propertyScroll.heightAnchor.constraint(equalToConstant: 100 * state.display.scale); propertyHeight.isActive = true
         NSLayoutConstraint.activate([properties.leadingAnchor.constraint(equalTo: document.leadingAnchor),properties.trailingAnchor.constraint(equalTo: document.trailingAnchor),properties.topAnchor.constraint(equalTo: document.topAnchor),properties.bottomAnchor.constraint(equalTo: document.bottomAnchor),document.widthAnchor.constraint(equalTo: propertyScroll.contentView.widthAnchor)])
         root.addArrangedSubview(propertyScroll); propertyScroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
-        bodyButton.isBordered = false; bodyButton.contentTintColor = .secondaryLabelColor; bodyButton.target = self; bodyButton.action = #selector(toggleBody)
         let actions = scaledStack(stack(.horizontal, spacing: 16))
-        actions.addArrangedSubview(bodyButton)
-        imageButton.isBordered = false; imageButton.contentTintColor = WriterStyle.muted; imageButton.target = self; imageButton.action = #selector(addImages)
-        imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)
-        imageButton.imagePosition = .imageLeading; imageButton.imageHugsTitle = true; imageButton.setAccessibilityLabel("画像を追加")
-        actions.addArrangedSubview(imageButton)
-        articleButton.target = self
-        articleButton.action = #selector(addArticle)
-        articleButton.imagePosition = .imageLeading
-        articleButton.imageHugsTitle = true
-        articleButton.setAccessibilityLabel("記事を取り込む")
-        actions.addArrangedSubview(articleButton)
-        for (button, action, label) in [(conversationButton, #selector(addConversation), "対話を取り込む"),
-                                        (fullTextButton, #selector(addFullText), "全文を取り込む")] {
+        for (button, action) in [(bodyButton, #selector(toggleBody)), (imageButton, #selector(addImages)),
+                                 (articleButton, #selector(addArticle)), (conversationButton, #selector(addConversation)),
+                                 (fullTextButton, #selector(addFullText))] {
             button.target = self
             button.action = action
             button.imagePosition = .imageLeading
             button.imageHugsTitle = true
-            button.setAccessibilityLabel(label)
             actions.addArrangedSubview(button)
         }
         actions.addArrangedSubview(imageCount)
@@ -211,12 +198,11 @@ final class WriterPanel: NSPanel {
 
         let footer = scaledStack(stack(.horizontal, spacing: 10))
         footer.distribution = .fill
-        destinationLabel.lineBreakMode = .byTruncatingTail
-        footer.addArrangedSubview(destinationLabel)
         sendButton.target = self
         sendButton.action = #selector(saveClicked)
         sendButton.bezelStyle = .rounded
         footer.addArrangedSubview(sendButton)
+        scaledConstraint(sendButton.widthAnchor.constraint(equalToConstant: 120)).isActive = true
         pendingButton.target = self
         pendingButton.action = #selector(resolvePending)
         pendingButton.bezelStyle = .rounded
@@ -261,7 +247,7 @@ final class WriterPanel: NSPanel {
         conversationButton.image = NSImage(systemSymbolName: "bubble.left.and.bubble.right", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         fullTextButton.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         let footerFont = state.display.scaledFont(size: 11)
-        for field in [status, destinationLabel, imageCount, imageSizeWarning] { field.font = footerFont }
+        for field in [status, imageCount, imageSizeWarning] { field.font = footerFont }
         for button in [sendButton, pendingButton, clearButton] { button.font = footerFont }
         fittingContent = false
     }
@@ -372,8 +358,7 @@ final class WriterPanel: NSPanel {
              "入力をクリアしました", "未接続 · サンプルタグを表示中 · 下書きはローカル保存"].contains(state.status) ||
             state.status.hasSuffix("枚追加しました"))
         let message = bodyLoadError ?? state.status
-        destinationLabel.stringValue = destination ?? "Notion未接続"
-        destinationLabel.toolTip = destination
+        sendButton.toolTip = state.connection == nil ? "設定からNotionに接続してください" : nil
         status.stringValue = message
         status.toolTip = message
         status.isHidden = quiet
@@ -594,67 +579,73 @@ final class WriterPanel: NSPanel {
     }
 
     @objc func addFullText() {
-        guard let window, window.attachedSheet == nil, bodyEditor.isEditable,
+        guard window?.attachedSheet == nil else { return }
+        showFullText()
+    }
+
+    private func showFullText(for sourceURL: URL? = nil, allowAIStudioFile: Bool = false) {
+        guard let window, bodyEditor.isEditable,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
         tagRows.forEach { $0.collapse() }
-        fullTextPrompt.show(in: window) { [weak self] text in
-            Task { await self?.importConversation(.fullText(text)) }
+        let chooseFile: (() -> Void)?
+        if allowAIStudioFile, let sourceURL {
+            chooseFile = { [weak self] in self?.chooseAIStudioFile(for: sourceURL) }
+        } else {
+            chooseFile = nil
+        }
+        fullTextPrompt.show(in: window, url: sourceURL, chooseFile: chooseFile) { [weak self] text in
+            Task { await self?.importConversation(.fullText(text, sourceURL: sourceURL)) }
         }
     }
 
     private func openConversation(_ url: URL) {
-        if case .aiStudio(let id) = try? ConversationLink(url) {
+        switch try? ConversationLink(url) {
+        case .chatGPTShared:
+            startConversation(.url(url), fallbackURL: url)
+        case .aiStudio(let id):
             if let file = state.aiStudioFile(for: id) {
-                startConversation(.aiStudio(url: url, file: file, remember: false))
+                startConversation(.aiStudio(url: url, file: file, remember: false), fallbackURL: url)
             } else {
-                chooseAIStudioFile(for: url, id: id)
+                showFullText(for: url, allowAIStudioFile: true)
             }
-        } else {
-            startConversation(.url(url))
+        case .chatGPTPrivate, nil:
+            showFullText(for: url)
         }
     }
 
-    private func chooseAIStudioFile(for url: URL, id: String) {
+    private func chooseAIStudioFile(for url: URL) {
         guard let window else { return }
-        let alert = NSAlert()
-        alert.messageText = "Google AI Studioの対話ファイルを選択"
-        alert.informativeText = "Google Driveに保存した元の対話ファイルを選ぶと、このURLに紐づけて読み取れます。ファイルを用意できない場合は、ブラウザで対話をコピーして「全文を取り込む…」を使えます。"
-        alert.addButton(withTitle: "ファイルを選ぶ…")
-        alert.addButton(withTitle: "Google Driveで開く")
-        let cancel = alert.addButton(withTitle: "キャンセル")
-        cancel.keyEquivalent = "\u{1B}"
-        alert.beginSheetModal(for: window) { [weak self] result in
-            switch result {
-            case .alertFirstButtonReturn:
-                let panel = NSOpenPanel()
-                panel.title = "Google AI Studioの対話ファイル"
-                panel.prompt = "読み込む"
-                panel.canChooseDirectories = false
-                panel.allowsMultipleSelection = false
-                panel.beginSheetModal(for: window) { response in
-                    if response == .OK, let file = panel.url {
-                        self?.startConversation(.aiStudio(url: url, file: file, remember: true))
-                    }
-                }
-            case .alertSecondButtonReturn:
-                if let drive = URL(string: "https://drive.google.com/file/d/" + id + "/view") { NSWorkspace.shared.open(drive) }
-            default:
-                break
+        let panel = NSOpenPanel()
+        panel.title = "Google AI Studioの対話ファイル"
+        panel.prompt = "読み込む"
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] result in
+            if result == .OK, let file = panel.url {
+                self?.startConversation(.aiStudio(url: url, file: file, remember: true), fallbackURL: url)
+            } else {
+                self?.showFullText(for: url, allowAIStudioFile: true)
             }
         }
     }
 
-    private func startConversation(_ source: ConversationImport.Source) {
+    private func startConversation(_ source: ConversationImport.Source, fallbackURL: URL) {
         Task {
             guard !(await importConversation(source)), let window, window.isVisible,
                   window.attachedSheet == nil, !state.importingImages else { return }
             let alert = NSAlert()
             alert.messageText = "対話を取り込めませんでした"
             alert.informativeText = state.status
-            alert.addButton(withTitle: "全文を取り込む…")
+            alert.addButton(withTitle: "全文を取り込む")
             alert.addButton(withTitle: "閉じる")
             alert.beginSheetModal(for: window) { [weak self] result in
-                if result == .alertFirstButtonReturn { self?.addFullText() }
+                if result == .alertFirstButtonReturn {
+                    if case .aiStudio = try? ConversationLink(fallbackURL) {
+                        self?.showFullText(for: fallbackURL, allowAIStudioFile: true)
+                    } else {
+                        self?.showFullText(for: fallbackURL)
+                    }
+                }
             }
         }
     }
@@ -670,12 +661,13 @@ final class WriterPanel: NSPanel {
             guard bodyEditor.string == previous else {
                 throw WriterError.validation("本文が変わりました。もう一度取り込んでください。")
             }
-            let fragment = MarkdownPreview.render(prepared.blocks, font: bodyEditor.baseFont)
+            let fragment = MarkdownPreview.render(prepared.blocks, font: bodyEditor.baseFont, transcript: true)
             let end = NSRange(location: previous.utf16.count, length: 0)
             bodyEditor.isEditable = true
             guard bodyEditor.insertWebBlocks(fragment, replacing: end) else {
                 throw WriterError.validation("取り込んだ内容を本文に追加できませんでした。")
             }
+            state.draft.usesTranscriptLayout = true
             if let url = prepared.url, let property = sourceURLProperty {
                 state.draft.urls[property.id] = url.absoluteString
             }
@@ -737,7 +729,7 @@ final class WriterPanel: NSPanel {
                     byID[id].map { bodyEditor.imageFragment($0, root: state.store.root, size: imagePreviewSize) }
                 }
                 attributed = draft.bodyFormat == .markdown
-                    ? MarkdownPreview.render(blocks, font: font, image: image)
+                    ? MarkdownPreview.render(blocks, font: font, transcript: draft.usesTranscriptLayout, image: image)
                     : BodyDocument.renderPlain(blocks, attributes: bodyEditor.normalAttributes, image: image)
             } else { attributed = plain }
             bodyLoadError = nil
@@ -746,7 +738,6 @@ final class WriterPanel: NSPanel {
             bodyLoadError = "本文を復元できませんでした。下書きを保護するため、本文の編集と送信を止めました。"
         }
         bodyEditor.textStorage?.setAttributedString(attributed)
-        bodyEditor.refreshBookmarkPreviews()
         let offset = min(previousSelection.location, attributed.length)
         bodyEditor.setSelectedRange(NSRange(location: offset, length: min(previousSelection.length, attributed.length - offset)))
         bodyEditor.typingAttributes = bodyEditor.normalAttributes
@@ -820,8 +811,10 @@ final class WriterPanel: NSPanel {
         imageCount.stringValue = images.isEmpty ? "" : "画像\(images.count)枚"
         imageSizeWarning.isHidden = !images.contains { $0.byteCount >= ImageAttachments.freePlanWarningBytes }
         updateThumbnails()
-        if bodyExpanded { bodyButton.title = "▾ 本文" }
-        else { bodyButton.title = state.draft.body.isEmpty && state.draft.images.isEmpty ? "▸ 本文を追加" : "▸ 本文" }
+        bodyButton.title = bodyExpanded || !state.draft.body.isEmpty || !state.draft.images.isEmpty ? "本文" : "本文を追加"
+        let direction = bodyExpanded ? "chevron.down" : "chevron.right"
+        let symbol = NSImage.SymbolConfiguration(pointSize: 12 * state.display.scale, weight: .regular)
+        bodyButton.image = NSImage(systemSymbolName: direction, accessibilityDescription: nil)?.withSymbolConfiguration(symbol)
     }
     @objc func toggleBody() {
         bodyExpanded.toggle()

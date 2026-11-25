@@ -41,7 +41,7 @@ enum WebClip {
             let content = parts(in: body, base: document.base)
             guard !content.isEmpty else { throw WriterError.validation("公開されている記事本文を読み取れませんでした。") }
             let header: [Part] = [
-                .block(PagePayload.bookmark(document.base ?? url)),
+                .block(PagePayload.urlText(document.base ?? url)),
                 .block(block("paragraph", runs: []))
             ]
             let heading = noteBody == nil ? nil : document.root.firstElement { $0.name == "h1" }
@@ -161,7 +161,7 @@ private struct Reader {
            let link = element.firstElement(where: { $0.name == "a" }),
            let url = WebResource.url(link.value("href"), relativeTo: base) {
             flush()
-            parts.append(.block(PagePayload.bookmark(url)))
+            parts.append(.block(PagePayload.urlText(url)))
             return
         }
         if tag == "img" {
@@ -178,7 +178,7 @@ private struct Reader {
         if tag == "iframe" || tag == "video" {
             if let url = WebResource.url(element.value("src"), relativeTo: base) {
                 flush()
-                parts.append(.block(PagePayload.bookmark(url)))
+                parts.append(.block(PagePayload.urlText(url)))
             }
             return
         }

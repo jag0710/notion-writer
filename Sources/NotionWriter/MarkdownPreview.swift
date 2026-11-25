@@ -34,17 +34,13 @@ enum MarkdownPreview {
         return render(blocks, font: font)
     }
 
-    static func render(_ blocks: [[String: Any]], font: NSFont, image: ((String) -> NSAttributedString?)? = nil) -> NSAttributedString {
+    static func render(_ blocks: [[String: Any]], font: NSFont, transcript: Bool = false, image: ((String) -> NSAttributedString?)? = nil) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var listNumber = 0
-        for block in blocks {
+        for original in blocks {
+            let block = PagePayload.replacingLegacyBookmark(original)
             if let id = PagePayload.imageReferenceID(block) {
                 if let attachment = image?(id) { result.append(attachment) }
-                listNumber = 0
-                continue
-            }
-            if let url = PagePayload.bookmarkURL(in: block) {
-                result.append(BodyBookmarkAttachment.fragment(url, font: font))
                 listNumber = 0
                 continue
             }
@@ -68,6 +64,7 @@ enum MarkdownPreview {
             default:
                 blockFont = font
             }
+            if transcript { TranscriptFormatting.stylePreview(style, kind: type, pointSize: size) }
             let line = NSMutableAttributedString()
             let prefix: String
             switch type {

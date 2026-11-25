@@ -30,7 +30,6 @@ final class OfflineProtocol: URLProtocol {
     static var pageStatus = 400
     static var pageRequests = 0
     static var schemaRequests = 0
-    static var rejectUpload = false
     static var conversationSchema = false
     static var pagePayload: Data?
     static var pageParentOverride: [String: String]?
@@ -67,9 +66,6 @@ final class OfflineProtocol: URLProtocol {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.viewID ?? "") ? $0 : nil } ?? TestDestination.withView
             value = ["id": target.viewID!, "name": "閲覧", "parent": ["database_id": target.databaseID],
                      "data_source_id": target.dataSourceID, "configuration": ["properties": [["property_id": "title"]]]]
-        } else if path == "/v1/file_uploads", Self.rejectUpload {
-            status = 403
-            value = ["object": "error", "code": "restricted_resource", "status": 403]
         } else if path == "/v1/file_uploads", Self.uploadCount < Self.uploadIDs.count {
             value = ["id": Self.uploadIDs[Self.uploadCount]]
             Self.uploadCount += 1
@@ -121,22 +117,16 @@ final class OfflineProtocol: URLProtocol {
     }
 }
 
-private actor BookmarkLookups {
-    private(set) var count = 0
-    func record() { count += 1 }
-}
-
 @main struct AppVerification {
     private static let isolatedPreferences = UserDefaults(suiteName: "NotionWriterVerify." + UUID().uuidString)!
 
     @MainActor static func state(root: URL, destination: NotionDestination = TestDestination.target,
-                                preferences: UserDefaults = isolatedPreferences,
-                                preview: @escaping @Sendable (URL) async -> BookmarkPreview? = { _ in nil }) throws -> AppState {
+                                preferences: UserDefaults = isolatedPreferences) throws -> AppState {
         let store = try LocalStore(root: root)
         try store.write(destination, name: "destination")
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [OfflineProtocol.self]
         let api = NotionClient(token: "offline-test-only", session: URLSession(configuration: config))
-        return try AppState(qa: false, dataRoot: root, clientOverride: { api }, preferences: preferences, bookmarkPreview: preview)
+        return try AppState(qa: false, dataRoot: root, clientOverride: { api }, preferences: preferences)
     }
     @MainActor static func main() async {
         _ = NSApplication.shared
@@ -544,49 +534,40 @@ private actor BookmarkLookups {
             try require(sharedState.draft.title == "本番用だけの下書き", "Switching back lost the main draft")
             OfflineProtocol.alternateDestination = nil
             print("PASS: read-only destination verification, cancellation and isolated destination switching")
-            let bookmarkRoot = root.appendingPathComponent("bookmarks", isDirectory: true)
-            let bookmarkState = try Self.state(root: bookmarkRoot)
-            let bookmarkWindow = WriterWindow(state: bookmarkState)
-            bookmarkWindow.toggleBody()
-            let bookmarkEditor = bookmarkWindow.bodyEditor
-            let article = "https://note.com/kenhori2/n/nb1856e88a60d"
-            let url = URL(string: article)!
-            try require(!bookmarkEditor.pasteWebURL("参考 " + article) && !bookmarkEditor.pasteWebURL("file:///tmp/test"),
-                        "Non-web text was handled as a bookmark URL")
-            try require(bookmarkEditor.pasteMarkdown("前の文章\n\n後ろの文章"), "Failed to prepare surrounding text")
-            let next = (bookmarkEditor.string as NSString).range(of: "後ろの文章").location
-            bookmarkEditor.setSelectedRange(NSRange(location: next, length: 0))
-            try require(bookmarkEditor.pasteWebURL(article), "A single web URL was not accepted")
-            let range = NSRange(location: next, length: (article as NSString).length)
-            let plain = try PagePayload.bodyBlocks(bookmarkState.draft)
-            try require(plain.allSatisfy { PagePayload.bookmarkURL(in: $0) == nil }, "Pasting created a bookmark without a choice")
-            try require(bookmarkEditor.makeBookmark(url, replacing: range), "Choosing a bookmark failed")
-            bookmarkState.draft.title = "ブックマーク"
-            try bookmarkState.flush()
-
-            let reopenedBookmarks = try Self.state(root: bookmarkRoot)
-            let restoredBookmarkWindow = WriterWindow(state: reopenedBookmarks)
-            restoredBookmarkWindow.toggleBody()
-            let restoredBookmarkEditor = restoredBookmarkWindow.bodyEditor
-            let restoredBlocks = BodyDocument.read(restoredBookmarkEditor.attributedString()).blocks
-            try require(restoredBlocks.compactMap { $0["type"] as? String } == ["paragraph", "bookmark", "paragraph"],
-                        "Restoring the bookmark reordered or changed the surrounding blocks")
-            try require(PagePayload.bookmarkURL(in: restoredBlocks[1]) == url, "The bookmark URL did not survive reopening")
-
+            let urlRoot = root.appendingPathComponent("article-urls")
+            let urlState = try Self.state(root: urlRoot)
+            let urlWriter = WriterWindow(state: urlState)
+            urlWriter.toggleBody()
+            let address = "https://example.org/article"
+            let url = URL(string: address)!
+            try require(!urlWriter.bodyEditor.pasteWebURL("参考 " + address) &&
+                        !urlWriter.bodyEditor.pasteWebURL("file:///tmp/test"), "Pasting misidentified plain or local text")
+            try require(urlWriter.bodyEditor.pasteWebURL(address) &&
+                        urlWriter.bodyEditor.attributedString().attribute(.link, at: 0, effectiveRange: nil) == nil,
+                        "A standalone URL became an annotated link")
+            let oldBookmark: [String: Any] = ["type": "bookmark", "bookmark": ["url": address]]
+            urlState.draft.title = "旧下書き"
+            urlState.draft.formattedBody = try JSONSerialization.data(withJSONObject: [
+                PagePayload.urlText(URL(string: "https://example.org/first")!), oldBookmark
+            ])
+            try urlState.flush()
+            let reopenedURLState = try Self.state(root: urlRoot)
+            let reopenedWriter = WriterWindow(state: reopenedURLState)
+            reopenedWriter.toggleBody()
+            try require(reopenedWriter.bodyEditor.string.contains(address) &&
+                        !reopenedWriter.bodyEditor.string.contains("\u{fffc}"), "A legacy bookmark did not reopen as text")
             OfflineProtocol.pageStatus = 200
-            await reopenedBookmarks.submit()
-            let savedPage = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
-            let children = savedPage?["children"] as? [[String: Any]] ?? []
-            try require(children.count == 3 && PagePayload.bookmarkURL(in: children[1]) == url,
-                        "The create-page request lost the bookmark")
-
-            let attachment = (restoredBookmarkEditor.string as NSString).range(of: "\u{fffc}")
-            try require(attachment.location != NSNotFound, "The bookmark attachment was not rendered")
-            restoredBookmarkEditor.setSelectedRange(attachment)
-            restoredBookmarkEditor.deleteBackward(nil)
-            try require(BodyDocument.read(restoredBookmarkEditor.attributedString()).blocks.count == 2,
-                        "Deleting the bookmark removed surrounding text or left an empty block")
-            print("PASS: web URL choice, bookmark restore, Notion payload and deletion")
+            let uploadsBefore = OfflineProtocol.uploadCount
+            await reopenedURLState.submit()
+            let saved = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
+            let children = saved?["children"] as? [[String: Any]] ?? []
+            let urlParagraph = children.last?["paragraph"] as? [String: Any]
+            let runs = urlParagraph?["rich_text"] as? [[String: Any]]
+            let text = runs?.first?["text"] as? [String: Any]
+            try require(children.count == 2 && children.last?["type"] as? String == "paragraph" &&
+                        text?["content"] as? String == url.absoluteString && text?["link"] == nil &&
+                        OfflineProtocol.uploadCount == uploadsBefore, "A legacy bookmark triggered a card or an upload")
+            print("PASS: pasted and legacy article URLs are plain text without preview uploads")
             let clipRoot = root.appendingPathComponent("article", isDirectory: true)
             let clipState = try Self.state(root: clipRoot)
             let clipWindow = WriterWindow(state: clipState)
@@ -612,7 +593,7 @@ private actor BookmarkLookups {
             try require(content.images.count == 1 && content.skippedImages == 1, "Article images were lost or failures were hidden")
             try require(clipEditor.insertWebBlocks(fragment, replacing: NSRange(location: 0, length: 0)), "Could not paste article")
             let articleBlocks = try PagePayload.bodyWithImages(clipState.draft)
-            try require(articleBlocks.compactMap { $0["type"] as? String } == ["heading_2", "paragraph", "paragraph", "bookmark", "draft_image", "paragraph", "paragraph", "paragraph", "paragraph"],
+            try require(articleBlocks.compactMap { $0["type"] as? String } == ["heading_2", "paragraph", "paragraph", "paragraph", "draft_image", "paragraph", "paragraph", "paragraph", "paragraph"],
                         "Article paste lost the order or a supported block")
             let articleJSON = String(decoding: try JSONSerialization.data(withJSONObject: articleBlocks, options: [.withoutEscapingSlashes]), as: UTF8.self)
             try require(articleJSON.contains("https://example.org/source") && articleJSON.contains("https://example.org/unavailable.png")
@@ -649,7 +630,6 @@ private actor BookmarkLookups {
             try await verifyBackgroundSend(root: root)
             try await verifyHistoryRetries(root: root)
             try await verifyHistoryLimit(root: root)
-            try await verifyBookmarkThumbnails(root: root, png: png)
             try await verifyConversationImport(root: root)
             print("PASS: app-level verification used isolated temporary data and offline transport")
         } catch { print("FAIL: \(error)"); exit(1) }
@@ -800,98 +780,5 @@ private actor BookmarkLookups {
         let expanded = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!)
         try require(expanded.historyLimit == 50 && expanded.recentSends == stored, "Increasing the limit restored deleted history")
         print("PASS: history limit menu, restart, 100-entry cap and newest-first pruning")
-    }
-
-    @MainActor private static func verifyBookmarkThumbnails(root: URL, png: Data) async throws {
-        let thumbnailURL = URL(string: "https://example.org/preview")!
-        let bareURL = URL(string: "https://example.org/no-preview")!
-        guard let jpeg = BookmarkPreview.jpegThumbnail(png) else { throw CheckFailure.failed("Bookmark thumbnail did not convert") }
-        let location = root.appendingPathComponent("thumbnail-send")
-        let domain = "NotionWriterVerify.Bookmarks." + UUID().uuidString
-        let preferences = UserDefaults(suiteName: domain)!
-        defer { preferences.removePersistentDomain(forName: domain) }
-        let lookups = BookmarkLookups()
-        let preview: @Sendable (URL) async -> BookmarkPreview? = { url in
-            await lookups.record()
-            return url == thumbnailURL ? BookmarkPreview(title: "記事のタイトル", summary: "記事の説明", thumbnail: jpeg) : nil
-        }
-        let state = try Self.state(root: location, preferences: preferences, preview: preview)
-        let writer = WriterWindow(state: state)
-        writer.toggleBody()
-        try require(writer.bodyEditor.pasteMarkdown("リンクの前"), "Missing text to check block order")
-        for url in [thumbnailURL, bareURL, thumbnailURL] {
-            let end = NSRange(location: writer.bodyEditor.string.utf16.count, length: 0)
-            try require(writer.bodyEditor.insertWebBlocks(BodyBookmarkAttachment.fragment(url, font: .systemFont(ofSize: 14)), replacing: end),
-                        "Could not insert bookmark fixture")
-        }
-        state.draft.title = "サムネイル付きの送信"
-        let draft = state.draft
-        let expectedTypes = ["paragraph", "callout", "bookmark", "callout"]
-        OfflineProtocol.uploadCount = 0
-        OfflineProtocol.pageStatus = 200
-        await state.submit()
-        let page = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
-        let blocks = page?["children"] as? [[String: Any]] ?? []
-        try require(state.draft.isEmpty && OfflineProtocol.uploadCount == 1 && blocks.compactMap { $0["type"] as? String } == expectedTypes,
-                    "Bookmark callout lost block order, the fallback, or the shared upload")
-        let callout = blocks[1]["callout"] as? [String: Any]
-        let text = callout?["rich_text"] as? [[String: Any]]
-        let title = text?.first?["text"] as? [String: Any]
-        let summary = text?.last?["text"] as? [String: Any]
-        let images = callout?["children"] as? [[String: Any]]
-        let image = images?.first?["image"] as? [String: Any]
-        try require(title?["content"] as? String == "記事のタイトル" &&
-                    (title?["link"] as? [String: String])?["url"] == thumbnailURL.absoluteString &&
-                    summary?["content"] as? String == "\n記事の説明" &&
-                    (image?["file_upload"] as? [String: String])?["id"] == OfflineProtocol.uploadIDs[0] &&
-                    PagePayload.bookmarkURL(in: blocks[2]) == bareURL,
-                    "Notion payload lost the thumbnail, the click target or the text")
-        let recordedBlocks = try PagePayload.bodyBlocks(state.recentSends[0].draft)
-        try require(recordedBlocks.compactMap(PagePayload.bookmarkURL(in:)) == [thumbnailURL, bareURL, thumbnailURL],
-                    "The history backup lost the source bookmarks")
-
-        state.draft = draft
-        OfflineProtocol.rejectUpload = true
-        await state.submit()
-        OfflineProtocol.rejectUpload = false
-        let fallback = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
-        let fallbackBlocks = fallback?["children"] as? [[String: Any]] ?? []
-        try require(state.draft.isEmpty && fallbackBlocks.compactMap(PagePayload.bookmarkURL(in:)) == [thumbnailURL, bareURL, thumbnailURL],
-                    "An optional thumbnail upload blocked page creation or lost the bookmark")
-        let settings = SettingsWindow(state: state)
-        guard let tabs = settings.window?.contentView?.subviews.compactMap({ $0 as? NSTabView }).first,
-              let general = tabs.tabViewItems.first(where: { $0.label == "一般" }),
-              let stack = general.view?.subviews.first as? NSStackView,
-              let menu = stack.arrangedSubviews.compactMap({ $0 as? NSPopUpButton }).first else {
-            throw CheckFailure.failed("General settings are missing the bookmark menu")
-        }
-        try require(menu.itemTitles == ["URLだけ貼る", "サムネイル付きカード"] &&
-                    menu.titleOfSelectedItem == "サムネイル付きカード", "Bookmark choices or the default are incorrect")
-        menu.selectItem(withTitle: "URLだけ貼る")
-        if let action = menu.action { NSApp.sendAction(action, to: menu.target, from: menu) }
-        let restarted = try Self.state(root: location, preferences: UserDefaults(suiteName: domain)!, preview: preview)
-        try require(restarted.bookmarkMode == .urlOnly, "Bookmark setting was not restored")
-
-        let previousLookups = await lookups.count
-        let previousUploads = OfflineProtocol.uploadCount
-        restarted.draft = draft
-        await restarted.submit()
-        let plain = try JSONSerialization.jsonObject(with: OfflineProtocol.pagePayload ?? Data()) as? [String: Any]
-        let plainBlocks = plain?["children"] as? [[String: Any]] ?? []
-        let outgoingURLs = plainBlocks.dropFirst().compactMap { block -> String? in
-            let paragraph = block["paragraph"] as? [String: Any]
-            let runs = paragraph?["rich_text"] as? [[String: Any]]
-            guard runs?.count == 1, let value = runs?.first?["text"] as? [String: Any],
-                  let content = value["content"] as? String, (value["link"] as? [String: String])?["url"] == content else {
-                return nil
-            }
-            return content
-        }
-        let currentLookups = await lookups.count
-        try require(restarted.draft.isEmpty && plainBlocks.allSatisfy { $0["type"] as? String == "paragraph" } &&
-                    outgoingURLs == [thumbnailURL, bareURL, thumbnailURL].map(\.absoluteString) &&
-                    previousLookups == currentLookups && previousUploads == OfflineProtocol.uploadCount,
-                    "URL-only delivery looked up previews, uploaded thumbnails, or lost the original links")
-        print("PASS: bookmark menu persists URL-only and thumbnail-card sends, keeping order and links")
     }
 }

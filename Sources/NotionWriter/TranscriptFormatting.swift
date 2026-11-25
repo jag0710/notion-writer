@@ -1,6 +1,24 @@
-import Foundation
+import AppKit
 
 enum TranscriptFormatting {
+    static func stylePreview(_ style: NSMutableParagraphStyle, kind: String, pointSize: CGFloat) {
+        let scale = pointSize / 15
+        style.lineSpacing = 3 * scale
+        switch kind {
+        case "paragraph":
+            style.paragraphSpacing = 11 * scale
+        case "bulleted_list_item", "numbered_list_item", "to_do":
+            style.firstLineHeadIndent = 2 * scale
+            style.headIndent = 25 * scale
+            style.paragraphSpacing = 5 * scale
+        case "heading_1", "heading_2", "heading_3":
+            style.paragraphSpacingBefore = 17 * scale
+            style.paragraphSpacing = 8 * scale
+        default:
+            style.paragraphSpacing = 8 * scale
+        }
+    }
+
     private static let widgets = try! NSRegularExpression(pattern: #"\uE200([a-z][a-z_0-9]*)\uE202([^\uE200\uE201]*)\uE201"#)
 
     static let widgetFields = [

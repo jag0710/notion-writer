@@ -5,6 +5,7 @@ import NotionWriterCore
     private let alert = NSAlert()
     private let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
     private let importButton: NSButton
+    private var submittedURL: URL?
 
     init(title: String, instruction: String, fieldLabel: String) {
         importButton = alert.addButton(withTitle: "取り込む")
@@ -19,19 +20,24 @@ import NotionWriterCore
         field.delegate = self
         field.isAutomaticTextCompletionEnabled = false
         alert.accessoryView = field
+        importButton.target = self
+        importButton.action = #selector(confirmImport)
     }
 
     private var url: URL? {
-        PagePayload.bookmarkURL(field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        let value = field.currentEditor()?.string ?? field.stringValue
+        return PagePayload.bookmarkURL(value.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func show(in window: NSWindow, onImport: @escaping (URL) -> Void) {
+        submittedURL = nil
         field.stringValue = ""
         importButton.isEnabled = false
         alert.layout()
         alert.window.initialFirstResponder = field
         alert.beginSheetModal(for: window) { [weak self] result in
-            if result == .alertFirstButtonReturn, let url = self?.url { onImport(url) }
+            guard result == .alertFirstButtonReturn, let url = self?.submittedURL else { return }
+            DispatchQueue.main.async { onImport(url) }
         }
         alert.window.makeFirstResponder(field)
     }
@@ -42,7 +48,16 @@ import NotionWriterCore
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard commandSelector == #selector(NSResponder.insertNewline(_:)), !textView.hasMarkedText() else { return false }
-        if importButton.isEnabled { importButton.performClick(nil) } else { NSSound.beep() }
+        confirmImport()
         return true
+    }
+
+    @objc private func confirmImport() {
+        guard let url, let parent = alert.window.sheetParent else {
+            NSSound.beep()
+            return
+        }
+        submittedURL = url
+        parent.endSheet(alert.window, returnCode: .alertFirstButtonReturn)
     }
 }

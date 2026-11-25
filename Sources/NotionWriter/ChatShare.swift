@@ -4,18 +4,13 @@ import NotionWriterCore
 enum ChatShare {
     private static let payloadMarker = "window.__reactRouterContext.streamController.enqueue("
     private static let maximumBytes = 10 * 1024 * 1024
-    private static let unreadable = WriterError.validation("ChatGPTのページから対話を読み取れませんでした。ブラウザで開き、内容をコピーして「全文を取り込む…」に貼り付けてください。")
+    private static let unreadable = WriterError.validation("ChatGPTのページから対話を読み取れませんでした。ブラウザで開き、内容をコピーして「全文を取り込む」に貼り付けてください。")
 
     static func load(_ link: ConversationLink) async throws -> Transcript {
-        let path: String
-        let id: String
-        switch link {
-        case .chatGPTShared(let value): path = "share"; id = value
-        case .chatGPTPrivate(let value): path = "c"; id = value
-        case .aiStudio: throw unreadable
+        guard case .chatGPTShared(let id) = link else {
+            throw WriterError.validation("非公開の対話はブラウザで開き、コピーした内容を「全文を取り込む」に貼り付けてください。")
         }
-
-        let url = URL(string: "https://chatgpt.com/" + path + "/" + id)!
+        let url = URL(string: "https://chatgpt.com/share/" + id)!
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieStorage = nil
@@ -37,19 +32,16 @@ enum ChatShare {
             var data = Data()
             for try await byte in bytes {
                 guard data.count < maximumBytes else {
-                    throw WriterError.validation("共有ページが大きすぎます。内容を分けて「全文を取り込む…」に貼り付けてください。")
+                    throw WriterError.validation("共有ページが大きすぎます。内容を分けて「全文を取り込む」に貼り付けてください。")
                 }
                 data.append(byte)
             }
             guard let html = String(data: data, encoding: .utf8) else { throw unreadable }
-            return try parse(html, routePrefix: "routes/" + path + ".")
+            return try parse(html)
         } catch {
             if Task.isCancelled { throw CancellationError() }
-            if path == "c" {
-                throw WriterError.validation("非公開チャットを読み取れませんでした。ブラウザのChatGPTログインはこのアプリと共有されません。ログイン済みのブラウザで対話を開き、コピーして「全文を取り込む…」に貼り付けてください。")
-            }
             if let error = error as? WriterError { throw error }
-            throw WriterError.validation("ChatGPTの共有ページに接続できませんでした。共有URLをブラウザで確認するか、「全文を取り込む…」を使ってください。")
+            throw WriterError.validation("ChatGPTの共有ページに接続できませんでした。共有URLをブラウザで確認するか、「全文を取り込む」を使ってください。")
         }
     }
 
