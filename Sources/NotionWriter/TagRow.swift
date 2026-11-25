@@ -10,9 +10,10 @@ func stack(_ orientation: NSUserInterfaceLayoutOrientation, spacing: CGFloat = 8
     return view
 }
 final class CandidateRow: NSTableRowView {
-    override var isEmphasized: Bool { get { true } set {} }
+    // The custom selection stays light, so controls should keep their normal text colors.
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
     override func drawSelection(in dirtyRect: NSRect) {
-        NSColor.controlAccentColor.withAlphaComponent(0.08).setFill()
+        NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
         NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
         NSColor.controlAccentColor.setFill()
         NSBezierPath(roundedRect: NSRect(x: 0, y: 5, width: 2, height: bounds.height - 10), xRadius: 1, yRadius: 1).fill()
@@ -29,7 +30,14 @@ final class TagSearchField: NSTextField {
     }
 }
 final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
-    let property: WriterProperty
+    enum Source {
+        case tags(WriterProperty)
+        case recent(() -> [(input: RecentPropertyInput, summary: String)])
+    }
+
+    private let source: Source
+    private let name: String
+    private let tagOptions: [TagOption]
     let propertyButton = QuietButton()
     var display: DisplayPreferences
     let search = TagSearchField()
@@ -45,7 +53,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private var selectedHeight: NSLayoutConstraint!
     var chipsHeight: NSLayoutConstraint!
     private enum Candidate: Equatable {
-        case heading, emptyHistory, emptySearch
+        case empty(String)
         case recent(RecentPropertyInput, String)
         case tag(TagOption)
 
@@ -58,7 +66,6 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     }
 
     private var candidates: [Candidate] = []
-    var recentInputs: (() -> [(RecentPropertyInput, String)])?
     var recall: ((RecentPropertyInput) -> Void)?
     var exitToTitle: (() -> Void)?
     var selection: [String]
@@ -72,13 +79,36 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private var rowHovered = false
     private var minimumHeight: NSLayoutConstraint!
     private var measuredCandidateWidth: CGFloat?
-    init(property: WriterProperty, selection: [String], display: DisplayPreferences) {
-        self.property = property; self.selection = selection; self.display = display
+    convenience init(property: WriterProperty, selection: [String], display: DisplayPreferences) {
+        self.init(source: .tags(property), selection: selection, display: display)
+    }
+
+    init(source: Source, selection: [String] = [], display: DisplayPreferences) {
+        self.source = source
+        self.selection = selection
+        self.display = display
+        let symbol: String
+        switch source {
+        case .tags(let property):
+            name = property.name
+            tagOptions = property.options
+            switch name {
+            case "アイディア": symbol = "lightbulb.fill"
+            case "作者or作品": symbol = "person.fill"
+            default: symbol = "tag.fill"
+            }
+        case .recent:
+            name = "最近の項目"
+            tagOptions = []
+            symbol = "clock.arrow.circlepath"
+        }
         super.init(frame: .zero)
         orientation = .horizontal; alignment = .centerY; spacing = 8 * display.scale
-        let title = propertyButton; title.title = property.name + "を追加"
+        let title = propertyButton
         title.isBordered = false; title.alignment = .left; title.font = display.scaledFont(size: display.propertySize); title.contentTintColor = WriterStyle.muted
-        title.image = NSImage(systemSymbolName: property.name == "アイディア" ? "lightbulb.fill" : (property.name == "作者or作品" ? "person.fill" : "tag.fill"), accessibilityDescription: nil); title.image = title.image?.withSymbolConfiguration(.init(pointSize: CGFloat(display.propertySize) * display.scale, weight: .regular)); title.imagePosition = .imageLeading; title.imageHugsTitle = true
+        title.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: CGFloat(display.propertySize) * display.scale, weight: .regular))
+        title.imagePosition = .imageLeading; title.imageHugsTitle = true
         title.target = self; title.action = #selector(openSearch); addArrangedSubview(title)
         emptyWidth = title.widthAnchor.constraint(equalTo: widthAnchor)
         title.setContentHuggingPriority(.required, for: .horizontal)
@@ -92,7 +122,10 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         chipsScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         chipsScroll.documentView = chips; chipsHeight = chipsScroll.heightAnchor.constraint(equalToConstant: CGFloat(display.propertySize + 8) * display.scale); chipsHeight.isActive = true
         addArrangedSubview(chipsScroll);
-        search.font = display.scaledFont(size: display.propertySize); search.placeholderString = "オプションを検索する…"; search.isBordered = false; search.focusRingType = .none; search.delegate = self
+        search.font = display.scaledFont(size: display.propertySize)
+        if case .recent = source { search.placeholderString = "最近の項目を検索する…" }
+        else { search.placeholderString = "オプションを検索する…" }
+        search.isBordered = false; search.focusRingType = .none; search.delegate = self
         let column = NSTableColumn(identifier: .init("tag")); table.addTableColumn(column); table.headerView = nil
         table.delegate = self; table.dataSource = self; table.rowHeight = max(28, CGFloat(display.propertySize + 14)) * display.scale; table.target = self; table.action = #selector(clicked)
         table.style = .plain; table.intercellSpacing = .zero; table.backgroundColor = .white; table.focusRingType = .none; table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
@@ -100,7 +133,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let content = NSViewController(); content.view = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 320))
         let root = stack(.vertical, spacing: 10 * display.scale); root.translatesAutoresizingMaskIntoConstraints = false
         let inset = 16 * display.scale
-        panelHeading.stringValue = property.name
+        panelHeading.stringValue = name
         panelHeading.font = .systemFont(ofSize: CGFloat(display.propertySize + 2) * display.scale, weight: .semibold)
         panelHeading.lineBreakMode = .byTruncatingTail
         root.addArrangedSubview(panelHeading)
@@ -128,7 +161,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         ])
         content.view.wantsLayer = true; content.view.layer?.backgroundColor = NSColor.white.cgColor; content.view.layer?.cornerRadius = 8; content.view.layer?.borderWidth = 1; content.view.layer?.borderColor = NSColor(white: 0.89, alpha: 1).cgColor; content.view.layer?.masksToBounds = true
         optionsPanel.contentViewController = content
-        optionsPanel.title = property.name + "の選択"
+        optionsPanel.title = name + "の選択"
         optionsPanel.backgroundColor = .clear; optionsPanel.isOpaque = false; optionsPanel.hasShadow = true
         optionsPanel.isReleasedWhenClosed = false; optionsPanel.isFloatingPanel = true; optionsPanel.level = .floating
         optionsPanel.appearance = NSAppearance(named: .aqua); optionsPanel.hidesOnDeactivate = true
@@ -198,7 +231,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let baseWidth = 560 * display.scale
         if measuredCandidateWidth == nil {
             let font = display.scaledFont(size: display.propertySize)
-            let widest = property.options.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+            let widest = tagOptions.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
             measuredCandidateWidth = max(baseWidth, ceil(widest + 76 * display.scale + 15))
         }
         let visibleRows = min(14, max(7, candidates.count))
@@ -218,7 +251,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         var x: CGFloat = 0
         var y: CGFloat = 0
         for id in selection {
-            let option = property.options.first { $0.id == id }
+            let option = tagOptions.first { $0.id == id }
             let name = option?.name ?? "削除されたタグ"
             let colors = NotionTagColors.named(option?.color ?? "default")
             let title = label(name, size: CGFloat(display.propertySize) * display.scale, color: colors.foreground)
@@ -287,11 +320,15 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         optionsPanel.parent?.removeChildWindow(optionsPanel); optionsPanel.orderOut(nil)
     }
     func refresh(preserveNavigation: Bool = false) {
-        propertyButton.title = property.name + (selection.isEmpty ? "を追加" : "")
+        if case .tags = source {
+            propertyButton.title = name + (selection.isEmpty ? "を追加" : "")
+        } else {
+            propertyButton.title = name
+        }
         emptyWidth.isActive = selection.isEmpty
         for view in chips.arrangedSubviews { chips.removeArrangedSubview(view); view.removeFromSuperview() }
         for id in selection {
-            let option = property.options.first { $0.id == id }
+            let option = tagOptions.first { $0.id == id }
             let button = QuietButton(title: option?.name ?? "削除されたタグ", target: self, action: #selector(openSearch))
             button.font = display.scaledFont(size: display.propertySize); button.identifier = .init(id); button.isBordered = false; button.contentTintColor = WriterStyle.ink; button.wantsLayer = true
             let colors = NotionTagColors.named(option?.color ?? "default")
@@ -304,7 +341,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
             button.cell?.lineBreakMode = .byClipping
             button.layer?.backgroundColor = colors.background.cgColor; button.layer?.cornerRadius = 4
-            button.toolTip = property.name + "の選択を開く"
+            button.toolTip = name + "の選択を開く"
             chips.addArrangedSubview(button)
         }
         chips.frame.size = chips.fittingSize
@@ -316,13 +353,17 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         let selected = candidates.indices.contains(table.selectedRow) ? candidates[table.selectedRow] : nil
         let previousOrigin = scroll.contentView.bounds.origin
         let query = search.stringValue
-        let tags = property.options.filter { query.isEmpty || $0.name.localizedStandardContains(query) }
-        candidates = tags.isEmpty ? [.emptySearch] : tags.map(Candidate.tag)
-        if query.isEmpty, let recentInputs {
-            let inputs = recentInputs()
-            let history: [Candidate] = inputs.isEmpty ? [.emptyHistory] : inputs.map { .recent($0.0, $0.1) }
-            candidates.insert(contentsOf: [.heading] + history, at: 0)
+        let emptyMessage: String
+        switch source {
+        case .tags:
+            candidates = tagOptions.filter { query.isEmpty || $0.name.localizedStandardContains(query) }.map(Candidate.tag)
+            emptyMessage = "一致するタグがありません"
+        case .recent(let inputs):
+            candidates = inputs().filter { query.isEmpty || $0.summary.localizedStandardContains(query) }
+                .map { .recent($0.input, $0.summary) }
+            emptyMessage = query.isEmpty ? "履歴なし" : "一致する項目がありません"
         }
+        if candidates.isEmpty { candidates = [.empty(emptyMessage)] }
         table.reloadData()
         let preserved = preserveNavigation ? selected.flatMap { candidates.firstIndex(of: $0) } : nil
         if let row = preserved ?? candidates.firstIndex(where: \.selectable) {
@@ -391,19 +432,19 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { candidates[row].selectable }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         switch candidates[row] {
-        case .heading:
-            let heading = label("最近の入力", size: 12 * display.scale, color: .secondaryLabelColor)
-            heading.font = .systemFont(ofSize: 12 * display.scale, weight: .semibold)
-            return heading
-        case .emptyHistory:
-            return label("履歴なし", size: 12 * display.scale, color: .secondaryLabelColor)
-        case .emptySearch:
-            return label("一致するタグがありません", size: 12 * display.scale, color: .secondaryLabelColor)
+        case .empty(let message):
+            return label(message, size: 12 * display.scale, color: .secondaryLabelColor)
         case .recent(_, let summary):
             let button = QuietButton(title: summary, target: self, action: #selector(clickedCandidate(_:)))
             button.alignment = .left
             button.font = display.scaledFont(size: display.propertySize)
-            button.contentTintColor = WriterStyle.ink
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingTail
+            button.attributedTitle = NSAttributedString(string: summary, attributes: [
+                .foregroundColor: WriterStyle.ink,
+                .font: display.scaledFont(size: display.propertySize),
+                .paragraphStyle: paragraph
+            ])
             button.cell?.lineBreakMode = .byTruncatingTail
             button.tag = row
             button.toolTip = summary

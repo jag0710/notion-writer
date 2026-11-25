@@ -81,23 +81,45 @@ func verifyVideoAndPropertyRecall(root: URL) async throws {
     reopened.draft.tags = ["reference": ["web", "character"]]
     reopened.draft.urls = ["url": "https://example.com/draft"]
     let writer = WriterWindow(state: reopened)
-    let row = writer.tagRows.first!
+    guard let row = writer.properties.arrangedSubviews.first as? TagRow, row.propertyButton.title == "最近の項目" else {
+        throw CheckFailure.failed("Recent items did not appear as the first property row")
+    }
+    try require(writer.properties.arrangedSubviews.filter { ($0 as? TagRow)?.propertyButton.title == "最近の項目" }.count == 1,
+                "There should be one recent-items row in the main window")
+    for tagRow in writer.tagRows {
+        tagRow.filter()
+        for index in 0..<tagRow.table.numberOfRows {
+            try require(tagRow.tableView(tagRow.table, viewFor: tagRow.table.tableColumns.first, row: index) is TagCandidateButton,
+                        "A tag picker included candidates from another source")
+        }
+    }
     row.filter()
-    try require(row.table.selectedRow == 1, "The first recent input was not selected below its heading")
+    try require(row.table.numberOfRows == 10 && row.table.selectedRow == 0,
+                "The recent-items picker should show just the ten saved inputs and select the newest")
+    let selectedView = row.tableView(row.table, rowViewForRow: 0)
+    selectedView?.isSelected = true
+    let selectedButton = row.tableView(row.table, viewFor: row.table.tableColumns.first, row: 0) as? NSButton
+    try require(selectedView?.interiorBackgroundStyle == .normal &&
+                selectedButton?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == WriterStyle.ink,
+                "Recent items lost their dark text on the light selection highlight")
     let editor = NSTextView()
     try require(row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.moveUp(_:))) &&
                 row.table.selectedRow == row.table.numberOfRows - 1, "Up did not wrap to the last candidate")
     try require(row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.moveDown(_:))) &&
-                row.table.selectedRow == 1, "Down did not wrap to the first selectable row")
+                row.table.selectedRow == 0, "Down did not wrap to the first selectable row")
     _ = row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.insertNewline(_:)))
     try require(reopened.draft.tags == ["reference": ["character"], "notes": ["idea"]] &&
                 reopened.draft.urls == ["url": "https://example.com/11"] &&
                 reopened.draft.title == "残すタイトル" && reopened.draft.body == "残す本文",
                 "Recall through Enter did not replace all properties alone")
     row.filter()
-    (row.tableView(row.table, viewFor: row.table.tableColumns.first, row: 2) as? NSButton)?.performClick(nil)
+    (row.tableView(row.table, viewFor: row.table.tableColumns.first, row: 1) as? NSButton)?.performClick(nil)
     try require(reopened.draft.tags["reference"] == ["web"] &&
                 reopened.draft.urls["url"] == "https://example.com/10", "Click did not restore the second property set")
+    writer.focusProperty(0)
+    _ = row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.insertTab(_:)))
+    try require(writer.tagRows.first?.optionsPanel.isVisible == true && !row.optionsPanel.isVisible,
+                "Tab moved to the wrong property after recent items")
     for direction in [#selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:))] {
         writer.focusProperty(0)
         _ = row.control(row.search, textView: editor, doCommandBy: direction)
@@ -105,5 +127,5 @@ func verifyVideoAndPropertyRecall(root: URL) async throws {
                     "Horizontal arrows did not return title focus")
     }
     writer.window?.orderOut(nil)
-    print("PASS: YouTube fields and failure safety, recent inputs across restart, keyboard wrap and Enter/click recall")
+    print("PASS: YouTube fields and failure safety, standalone recent items, selected text contrast and Enter/click recall")
 }

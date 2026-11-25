@@ -10,6 +10,7 @@ if [[ $# -eq 1 && "$1" == --trial ]]; then
     BUNDLE_ID="$BUNDLE_ID.trial"
     APP_NAME="Notion Writer Trial"
     DISPLAY_NAME="Notion Writer 試験版"
+    BUNDLE_VERSION="13"
 elif [[ $# -ne 0 ]]; then
     printf 'Usage: %s [--trial]\n' "$0" >&2
     exit 2

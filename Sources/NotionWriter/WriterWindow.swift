@@ -112,6 +112,20 @@ final class WriterPanel: NSPanel {
     private var thumbnailIDs: [String] = []
     private var thumbnailScale: CGFloat = 0
     var tagRows: [TagRow] = []
+    private lazy var recentPropertiesRow: TagRow = {
+        let row = TagRow(source: .recent { [weak self] in
+            guard let self else { return [] }
+            let schema = state.visibleSchema
+            return state.recentPropertyInputs.map { (input: $0, summary: $0.summary(in: schema)) }
+        }, display: state.display)
+        row.activated = { [weak self] in self?.focusProperty(0) }
+        row.move = { [weak self] back in self?.focusProperty(back ? -1 : 1) }
+        row.exitToTitle = { [weak self] in self?.focusTitle() }
+        row.recall = { [weak self] input in self?.applyRecentPropertyInput(input) }
+        row.saveRequested = { [weak self] in self?.submit() }
+        return row
+    }()
+    private var propertyPickers: [TagRow] { [recentPropertiesRow] + tagRows }
     var urlFields: [NSTextField] = []
     var renderedSchema: Schema?
     var renderedDisplay: DisplayPreferences?
@@ -143,7 +157,10 @@ final class WriterPanel: NSPanel {
         NSLayoutConstraint.activate([scaledConstraint(root.topAnchor.constraint(equalTo: content.topAnchor, constant: 20)),scaledConstraint(root.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -16)),scaledConstraint(root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24)),scaledConstraint(root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24))])
         let titleScroll = editorScroll(titleEditor); titleHeight = titleScroll.heightAnchor.constraint(equalToConstant: 80); titleHeight.isActive = true
         titleEditor.setAccessibilityLabel("文章（Notionのタイトル）"); titleEditor.string = state.draft.title
-        titleEditor.tab = { [weak self] back in self?.focusProperty(back ? ((self?.tagRows.count ?? 0) + (self?.urlFields.count ?? 0) - 1) : 0) }
+        titleEditor.tab = { [weak self] back in
+            guard let self else { return }
+            focusProperty(back ? propertyPickers.count + urlFields.count - 1 : 0)
+        }
         titleEditor.dismiss = { [weak self] in self?.hide() }
         titleEditor.compositionChanged = { [weak self] in
             guard let self, !resettingDraft else { return }
@@ -187,7 +204,11 @@ final class WriterPanel: NSPanel {
         bodyEditor.setAccessibilityLabel("本文")
         bodyEditor.allowsUndo = true
         bodyEditor.importsGraphics = false
-        bodyEditor.tab = { [weak self] back in if back { self?.focusProperty((self?.tagRows.count ?? 0) + (self?.urlFields.count ?? 0) - 1) } else { self?.window?.makeFirstResponder(self?.titleEditor) } }
+        bodyEditor.tab = { [weak self] back in
+            guard let self else { return }
+            if back { focusProperty(propertyPickers.count + urlFields.count - 1) }
+            else { focusTitle() }
+        }
         bodyEditor.dismiss = { [weak self] in self?.hide() }
         bodyScroll.documentView = bodyEditor
         bodyScroll.hasVerticalScroller = true
@@ -305,7 +326,7 @@ final class WriterPanel: NSPanel {
     func show() {
         if window?.isVisible != true { bodyExpanded = false }
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = NSWorkspace.shared.frontmostApplication }
-        tagRows.forEach { $0.collapse() }; update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil)
+        propertyPickers.forEach { $0.collapse() }; update(); NSApp.activate(ignoringOtherApps: true); window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(titleEditor)
         if state.display.fixedPosition {
             let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
@@ -316,7 +337,7 @@ final class WriterPanel: NSPanel {
         fitContent(); state.opened()
     }
     func hide() {
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         do { try state.flush() } catch { showError(error); return }
         orderOut()
     }
@@ -346,36 +367,41 @@ final class WriterPanel: NSPanel {
     }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         guard !textView.hasMarkedText(), let field = control as? NSTextField, let index = urlFields.firstIndex(of: field) else { return false }
-        if selector == #selector(NSResponder.insertTab(_:)) { focusProperty(tagRows.count + index + 1); return true }
-        if selector == #selector(NSResponder.insertBacktab(_:)) { focusProperty(tagRows.count + index - 1); return true }
+        if selector == #selector(NSResponder.insertTab(_:)) { focusProperty(propertyPickers.count + index + 1); return true }
+        if selector == #selector(NSResponder.insertBacktab(_:)) { focusProperty(propertyPickers.count + index - 1); return true }
         switch selector {
         case #selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:)),
              #selector(NSResponder.moveBackward(_:)), #selector(NSResponder.moveForward(_:)):
             focusTitle()
             return true
         case #selector(NSResponder.moveUp(_:)), #selector(NSResponder.moveDown(_:)):
-            let count = tagRows.count + urlFields.count
+            let count = propertyPickers.count + urlFields.count
             let delta = selector == #selector(NSResponder.moveUp(_:)) ? -1 : 1
-            focusProperty((tagRows.count + index + delta + count) % count)
+            focusProperty((propertyPickers.count + index + delta + count) % count)
             return true
         default:
             return false
         }
     }
     func focusProperty(_ index: Int) {
-        tagRows.forEach { $0.collapse() }
-        if tagRows.indices.contains(index) {
-            let row = tagRows[index]; row.focus(); row.scrollToVisible(row.bounds)
-        } else if urlFields.indices.contains(index - tagRows.count) {
-            let field = urlFields[index - tagRows.count]
+        let pickers = propertyPickers
+        pickers.forEach { $0.collapse() }
+        if pickers.indices.contains(index) {
+            let row = pickers[index]
+            row.scrollToVisible(row.bounds)
+            row.focus()
+        } else if urlFields.indices.contains(index - pickers.count) {
+            let field = urlFields[index - pickers.count]
             field.scrollToVisible(field.bounds)
             window?.makeFirstResponder(field)
+        } else if index >= pickers.count + urlFields.count && bodyExpanded {
+            window?.makeFirstResponder(bodyEditor)
+        } else {
+            window?.makeFirstResponder(titleEditor)
         }
-        else if index >= tagRows.count + urlFields.count && bodyExpanded { window?.makeFirstResponder(bodyEditor) }
-        else { window?.makeFirstResponder(titleEditor) }
     }
     private func focusTitle() {
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         window?.makeKey()
         window?.makeFirstResponder(titleEditor)
     }
@@ -421,8 +447,8 @@ final class WriterPanel: NSPanel {
         if renderedSchema?.properties != schema.properties || renderedSchema?.dataSourceID != schema.dataSourceID || renderedDisplay?.overallPercent != state.display.overallPercent {
             rebuildProperties(schema); renderedSchema = schema
         }
-        for row in tagRows {
-            let values = state.draft.tags[row.property.id] ?? []
+        for (row, property) in zip(tagRows, schema.tags) {
+            let values = state.draft.tags[property.id] ?? []
             if row.selection != values { row.selection = values; row.refresh() }
         }
         for field in urlFields {
@@ -435,7 +461,7 @@ final class WriterPanel: NSPanel {
             applyDisplayLayout()
             titleEditor.font = state.display.scaledFont(size: state.display.titleSize)
             titleEditor.needsDisplay = true
-            tagRows.forEach { $0.applyDisplay(state.display) }
+            propertyPickers.forEach { $0.applyDisplay(state.display) }
             urlFields.forEach { $0.font = state.display.scaledFont(size: state.display.propertySize) }
             bodyButton.font = state.display.scaledFont(size: state.display.propertySize)
             imageButton.font = bodyButton.font
@@ -514,20 +540,22 @@ final class WriterPanel: NSPanel {
         for child in view.subviews { setEnabled(child, enabled: enabled) }
     }
     func rebuildProperties(_ schema: Schema) {
-        for view in properties.arrangedSubviews { properties.removeArrangedSubview(view); view.removeFromSuperview() }
+        propertyPickers.forEach { $0.collapse() }
+        for view in properties.arrangedSubviews where view !== recentPropertiesRow {
+            properties.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
         tagRows = []; urlFields = []
+        if recentPropertiesRow.superview == nil {
+            properties.insertArrangedSubview(recentPropertiesRow, at: 0)
+            recentPropertiesRow.widthAnchor.constraint(equalTo: properties.widthAnchor).isActive = true
+        }
         for property in schema.tags {
-            let index = tagRows.count
+            let index = propertyPickers.count
             let row = TagRow(property: property, selection: state.draft.tags[property.id] ?? [], display: state.display)
             row.saveRequested = { [weak self] in self?.submit() }
             row.activated = { [weak self] in self?.focusProperty(index) }
             row.exitToTitle = { [weak self] in self?.focusTitle() }
-            row.recentInputs = { [weak self] in
-                guard let self else { return [] }
-                let schema = state.visibleSchema
-                return state.recentPropertyInputs.map { ($0, $0.summary(in: schema)) }
-            }
-            row.recall = { [weak self] input in self?.applyRecentPropertyInput(input) }
             row.layoutChanged = { [weak self] in self?.fitContent() }
             row.changed = { [weak self] values in
                 guard let self else { return }
@@ -552,7 +580,7 @@ final class WriterPanel: NSPanel {
     }
     @objc func addImages() {
         guard let window, bodyEditor.isEditable, !bodyEditor.hasMarkedText() else { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         let offset = bodyExpanded ? NSMaxRange(bodyEditor.selectedRange()) : nil
         let panel = NSOpenPanel()
         panel.title = "本文に追加する画像を選択"; panel.prompt = "画像を追加"
@@ -581,7 +609,7 @@ final class WriterPanel: NSPanel {
     @objc private func addVideo() {
         guard let window, window.attachedSheet == nil, videoButton.isEnabled,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         videoPrompt.show(in: window) { [weak self] url in
             Task {
                 guard let self else { return }
@@ -593,7 +621,7 @@ final class WriterPanel: NSPanel {
     @objc private func addArticle() {
         guard let window, window.attachedSheet == nil, bodyEditor.isEditable,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         articlePrompt.show(in: window) { [weak self] url in
             guard let self else { return }
             loadBodyDraft(force: true)
@@ -642,7 +670,7 @@ final class WriterPanel: NSPanel {
     @objc func addConversation() {
         guard let window, window.attachedSheet == nil, bodyEditor.isEditable,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         conversationPrompt.show(in: window) { [weak self] url in self?.openConversation(url) }
     }
 
@@ -654,7 +682,7 @@ final class WriterPanel: NSPanel {
     private func showFullText(for sourceURL: URL? = nil, allowAIStudioFile: Bool = false) {
         guard let window, bodyEditor.isEditable,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         let chooseFile: (() -> Void)?
         if allowAIStudioFile, let sourceURL {
             chooseFile = { [weak self] in self?.chooseAIStudioFile(for: sourceURL) }
@@ -771,7 +799,7 @@ final class WriterPanel: NSPanel {
         bodyExpanded = false
         loadBodyDraft(force: true)
         updateBodyPresentation()
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         titleEditor.setSelectedRange(NSRange(location: 0, length: 0))
         titleEditor.scrollRangeToVisible(NSRange(location: 0, length: 0))
         fitContent()
@@ -896,7 +924,7 @@ final class WriterPanel: NSPanel {
     @objc private func clearInput() {
         guard state.canClearDraft else { return }
         if (window?.firstResponder as? NSTextView)?.hasMarkedText() == true { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         window?.makeFirstResponder(titleEditor)
         do {
             try state.clearDraft()
@@ -908,7 +936,7 @@ final class WriterPanel: NSPanel {
     func submit() {
         guard bodyLoadError == nil else { return }
         if let editor = window?.firstResponder as? NSTextView, editor.hasMarkedText() { return }
-        tagRows.forEach { $0.collapse() }
+        propertyPickers.forEach { $0.collapse() }
         Task { await state.submit { [weak self] in self?.orderOut() } }
     }
     @objc func resolvePending() {
