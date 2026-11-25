@@ -110,7 +110,7 @@ import NotionWriterCore
         root.setCustomSpacing(24, after: disconnectAIStudioButton)
 
         root.addArrangedSubview(label("記事取り込み", size: 16))
-        explain("記事のURLを本文の先頭にテキストとして追加します。", in: root)
+        explain("元の記事URLをURLプロパティに記録し、本文中のリンクを保持します。", in: root)
         if let detail = root.arrangedSubviews.last { root.setCustomSpacing(24, after: detail) }
 
         root.addArrangedSubview(label("全文取り込み", size: 16))

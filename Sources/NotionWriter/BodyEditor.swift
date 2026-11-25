@@ -72,7 +72,9 @@ final class BodyEditor: WriterTextView {
         dismissCommands()
         var attributes = normalAttributes.merging(block) { _, new in new }
         attributes[.font] = activeFont
-        let link = NSAttributedString(string: url.absoluteString, attributes: attributes)
+        var linkAttributes = attributes
+        linkAttributes[.link] = url
+        let link = NSAttributedString(string: url.absoluteString, attributes: linkAttributes)
         guard replace(range, with: link) else { return false }
         typingAttributes = attributes
 

@@ -25,6 +25,7 @@ extension AppVerification {
                     "The import settings are not next to the Notion connection tab")
 
         state.draft.title = "既存タイトル"
+        state.draft.tags = ["notes": ["memo"]]
         state.draft.urls = ["other": "https://example.com/other", "url": "https://example.com/previous"]
         writer.toggleBody()
         try require(writer.bodyEditor.pasteMarkdown("既存メモ\n\n- 元の項目"), "Could not prepare the existing note")
@@ -45,8 +46,11 @@ extension AppVerification {
             return try ChatShare.parse(html)
         }
         try require(imported && state.draft.title == "既存タイトル" &&
+                    state.draft.tags["notes"] == ["memo", "ai"] &&
                     state.draft.urls == ["other": "https://example.com/other", "url": shared.absoluteString], "Import changed title or the unrelated URL")
         let current = writer.bodyEditor.string
+        let suggested = try await ConversationImport.prepare(.url(shared)) { _ in try ChatShare.parse(html) }
+        try require(suggested.title == "共有対話のタイトル", "Shared conversation title did not reach the importer")
         func headingsHavePrototypeSpacing(_ editor: NSTextView) -> Bool {
             let range = (editor.string as NSString).range(of: "ChatGPT")
             guard range.location != NSNotFound,
@@ -73,7 +77,7 @@ extension AppVerification {
                     "Cancelled fetch did not return the cancelled state or changed the draft")
         let pasted = await writer.importConversation(.fullText("前書き\n\n**User:** 行を残す\n\nAssistant: 別サービスの答え\n- [根拠](https://example.com/source)"))
         let plain = await writer.importConversation(.fullText("普通の記録\n改行を保持する\n\n最後の段落"))
-        try require(pasted && plain && state.draft.urls["url"] == shared.absoluteString &&
+        try require(pasted && plain && state.draft.tags["notes"] == ["memo", "ai"] && state.draft.urls["url"] == shared.absoluteString &&
                     containsInOrder(writer.bodyEditor.string, ["前書き", "あなた", "行を残す", "AI", "別サービスの答え", "普通の記録", "最後の段落"]),
                     "Full text import lost a preface, dialogue or ordinary text")
 
@@ -90,19 +94,67 @@ extension AppVerification {
                     blocks.contains { $0["type"] as? String == "bulleted_list_item" } &&
                     properties?["url"]?["url"] as? String == shared.absoluteString &&
                     properties?["other"]?["url"] as? String == "https://example.com/other" &&
+                    (properties?["notes"]?["multi_select"] as? [[String: String]])?.compactMap { $0["id"] } == ["memo", "ai"] &&
                     links.contains("https://example.com/source"),
                     "Notion request lost the bookmark-free URL, paragraph breaks, links, or ordered content")
         let privateURL = URL(string: "https://chatgpt.com/c/" + id)!
         let aiURL = URL(string: "https://aistudio.google.com/prompts/abcdef12345")!
         let privateBrowser = await writer.importConversation(.fullText("You said: 質問\nChatGPT said: 回答", sourceURL: privateURL))
-        try require(privateBrowser && state.draft.urls["url"] == privateURL.absoluteString &&
+        try require(privateBrowser && state.draft.title == "質問" && state.draft.tags["notes"] == ["ai"] &&
+                    state.draft.urls["url"] == privateURL.absoluteString &&
                     containsInOrder(writer.bodyEditor.string, ["あなた", "質問", "ChatGPT", "回答"]),
                     "Browser copy lost the private ChatGPT link or speaker")
         let aiBrowser = await writer.importConversation(.fullText("User:\n問い\nModel:\n答え", sourceURL: aiURL))
         try require(aiBrowser && state.draft.urls["url"] == aiURL.absoluteString &&
                     containsInOrder(writer.bodyEditor.string, ["あなた", "問い", "Google AI Studio", "答え"]),
                     "The file-free AI Studio flow lost the origin or speaker")
-        print("PASS: AppKit import, preview spacing, browser copy, URL preservation and cancellation")
+        let widget = """
+        # 貼り付けの題名
+
+        <grid columns={2}>
+          <card gap={1}>
+            <caption>指標</caption>
+            <title>123件</title>
+          </card>
+        </grid>
+        引用のついた文<Cite refs={["turn1search1"]}/>
+        \u{0060}<card gap={1}>\u{0060}
+
+        ~~~xml
+        <card><title>コード例</title></card>
+        ~~~
+        """
+        let cleaned = try await ConversationImport.prepare(.fullText(widget))
+        let widgetText = conversationText(cleaned.blocks)
+        try require(cleaned.title == "貼り付けの題名" && widgetText.contains("指標 — 123件") &&
+                    widgetText.contains("引用のついた文") && !widgetText.contains("<grid") &&
+                    !widgetText.contains("turn1search1") && widgetText.contains("<card gap={1}>") &&
+                    cleaned.blocks.contains { $0["type"] as? String == "code" &&
+                        conversationText([$0]).contains("<card><title>コード例</title></card>") },
+                    "Shared widget cleanup damaged visible text, title or code samples")
+        print("PASS: AppKit import titles and AI tag, link and layout preservation, widget cleanup and cancellation")
+    }
+
+    @MainActor static func verifyLiveWidgets(_ address: URL, root: URL) async throws {
+        OfflineProtocol.conversationSchema = true
+        defer { OfflineProtocol.conversationSchema = false }
+        let state = try Self.state(root: root.appendingPathComponent("live-widgets"))
+        await state.sync()
+        let writer = WriterWindow(state: state)
+        let imported = await writer.importConversation(.url(address))
+        let preview = writer.bodyEditor.string
+        try require(imported && !state.draft.title.isEmpty && state.draft.tags["notes"] == ["ai"] &&
+                    state.draft.urls["url"] == address.absoluteString && preview.contains(" — ") &&
+                    !preview.contains("<grid") && !preview.contains("<card") && !preview.contains("<Cite") &&
+                    !preview.contains("<box") && !preview.contains("<row"),
+                    "Live conversation left markup or lost visible values and metadata")
+        OfflineProtocol.pageStatus = 200
+        await state.submit()
+        let payload = try conversationJSON(OfflineProtocol.pagePayload ?? Data())
+        let children = payload["children"] as? [[String: Any]] ?? []
+        try require(state.draft.isEmpty && conversationText(children).contains(" — ") &&
+                    !conversationLinks(children).isEmpty, "Live widget data or source links were lost on send")
+        print("PASS: live ChatGPT share rendered card text, title, AI tag, source URL and clickable citations in mock Notion request")
     }
 
     @MainActor static func verifyConversationSamples(_ args: [String], root: URL) async throws {
@@ -240,7 +292,8 @@ extension AppVerification {
             }
             return index
         }
-        _ = reference(["loaderData": ["routes/share.fixture": ["serverResponse": ["data": ["linear_conversation": timeline]]]]])
+        let conversation: [String: Any] = ["linear_conversation": timeline, "title": "共有対話のタイトル"]
+        _ = reference(["loaderData": ["routes/share.fixture": ["serverResponse": ["data": conversation]]]])
         let data = try JSONSerialization.data(withJSONObject: table)
         let argument = try JSONEncoder().encode(String(decoding: data, as: UTF8.self))
         return "<script>window.__reactRouterContext.streamController.enqueue(\"[]\");</script>" +

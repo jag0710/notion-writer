@@ -61,6 +61,10 @@ final class OfflineProtocol: URLProtocol {
             if Self.conversationSchema {
                 properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
                 properties["別のリンク"] = ["id": "other", "name": "別のリンク", "type": "url"]
+                properties["雑記"] = ["id": "notes", "name": "雑記", "type": "multi_select",
+                                     "multi_select": ["options": [
+                                        ["id": "ai", "name": "AI", "color": "purple"],
+                                        ["id": "memo", "name": "メモ", "color": "blue"]]]]
             }
             if Self.propertyRecallSchema {
                 properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
@@ -144,6 +148,11 @@ final class OfflineProtocol: URLProtocol {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("NotionWriterVerification-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         do {
+            if CommandLine.arguments.dropFirst().first == "--verify-live-widgets",
+               let value = CommandLine.arguments.dropFirst(2).first, let address = URL(string: value) {
+                try await verifyLiveWidgets(address, root: root)
+                return
+            }
             if CommandLine.arguments.dropFirst().first == "--verify-conversation-samples" {
                 try await verifyConversationSamples(Array(CommandLine.arguments.dropFirst(2)), root: root)
                 return
@@ -564,12 +573,13 @@ final class OfflineProtocol: URLProtocol {
             try require(!urlWriter.bodyEditor.pasteWebURL("参考 " + address) &&
                         !urlWriter.bodyEditor.pasteWebURL("file:///tmp/test"), "Pasting misidentified plain or local text")
             try require(urlWriter.bodyEditor.pasteWebURL(address) &&
-                        urlWriter.bodyEditor.attributedString().attribute(.link, at: 0, effectiveRange: nil) == nil,
-                        "A standalone URL became an annotated link")
+                        urlWriter.bodyEditor.attributedString().attribute(.link, at: 0, effectiveRange: nil) as? URL == url,
+                        "A standalone URL lacked its link")
             let oldBookmark: [String: Any] = ["type": "bookmark", "bookmark": ["url": address]]
             urlState.draft.title = "旧下書き"
             urlState.draft.formattedBody = try JSONSerialization.data(withJSONObject: [
-                PagePayload.urlText(URL(string: "https://example.org/first")!), oldBookmark
+                ["type": "paragraph", "paragraph": ["rich_text": [["type": "text",
+                    "text": ["content": "参考 https://example.org/first。補足"]]]]], oldBookmark
             ])
             try urlState.flush()
             let reopenedURLState = try Self.state(root: urlRoot)
@@ -585,10 +595,16 @@ final class OfflineProtocol: URLProtocol {
             let urlParagraph = children.last?["paragraph"] as? [String: Any]
             let runs = urlParagraph?["rich_text"] as? [[String: Any]]
             let text = runs?.first?["text"] as? [String: Any]
+            let inlineURLRuns = (children.first?["paragraph"] as? [String: Any])?["rich_text"] as? [[String: Any]] ?? []
             try require(children.count == 2 && children.last?["type"] as? String == "paragraph" &&
-                        text?["content"] as? String == url.absoluteString && text?["link"] == nil &&
-                        OfflineProtocol.uploadCount == uploadsBefore, "A legacy bookmark triggered a card or an upload")
-            print("PASS: pasted and legacy article URLs are plain text without preview uploads")
+                        text?["content"] as? String == url.absoluteString &&
+                        (text?["link"] as? [String: String])?["url"] == url.absoluteString &&
+                        inlineURLRuns.compactMap { ($0["text"] as? [String: Any])?["content"] as? String }.joined() ==
+                            "参考 https://example.org/first。補足" &&
+                        inlineURLRuns.contains { ((($0["text"] as? [String: Any])?["link"]) as? [String: String])?["url"] ==
+                            "https://example.org/first" } &&
+                        OfflineProtocol.uploadCount == uploadsBefore, "A legacy URL lost its link, text, or punctuation")
+            print("PASS: pasted, bare and legacy URLs produce Notion links without attachment uploads")
             let clipRoot = root.appendingPathComponent("article", isDirectory: true)
             let clipState = try Self.state(root: clipRoot)
             let clipWindow = WriterWindow(state: clipState)
@@ -600,6 +616,16 @@ final class OfflineProtocol: URLProtocol {
               <p>後半</p><p><br></p><img src="/unavailable.png" alt="取得できない画像"><script>skip me</script></article>
             """
             let base = URL(string: "https://example.org/article")!
+            let remoteArticle = try await WebClip.read(.article(base)) { url in
+                guard let document = WebDocument(html: "<html><head><title>記事の題名</title></head><body>" + html + "</body></html>",
+                                                 base: url) else { throw CheckFailure.failed("Could not parse article fixture") }
+                return document
+            }
+            guard case .block(let firstArticleBlock) = remoteArticle.parts.first else {
+                throw CheckFailure.failed("An article should start with its content")
+            }
+            try require(remoteArticle.title == "【記事の題名】" && firstArticleBlock["type"] as? String == "heading_2",
+                        "Import prepended the source URL to the article content")
             let content = try await WebClip.prepare(.selection(html, base: base, fallback: nil),
                                                     root: clipRoot, availableImages: 100) { url in
                 if url.lastPathComponent == "unavailable.png" { throw URLError(.resourceUnavailable) }
@@ -618,7 +644,7 @@ final class OfflineProtocol: URLProtocol {
                         "Article paste lost the order or a supported block")
             let articleJSON = String(decoding: try JSONSerialization.data(withJSONObject: articleBlocks, options: [.withoutEscapingSlashes]), as: UTF8.self)
             try require(articleJSON.contains("https://example.org/source") && articleJSON.contains("https://example.org/unavailable.png")
-                        && articleJSON.contains("bold") && !articleJSON.contains("skip me"), "Article formatting or links were not preserved")
+                        && articleJSON.contains("\"url\":\"https://example.org/news\"") && articleJSON.contains("bold") && !articleJSON.contains("skip me"), "Article formatting or links were not preserved")
             let paragraphRuns = (articleBlocks[1]["paragraph"] as? [String: Any])?["rich_text"] as? [[String: Any]] ?? []
             let paragraph = paragraphRuns.compactMap { ($0["text"] as? [String: Any])?["content"] as? String }.joined()
             let blank = (articleBlocks[2]["paragraph"] as? [String: Any])?["rich_text"] as? [[String: Any]]

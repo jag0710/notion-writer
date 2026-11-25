@@ -32,7 +32,7 @@ final class TagSearchField: NSTextField {
 final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     enum Source {
         case tags(WriterProperty)
-        case recent(() -> [(input: RecentPropertyInput, summary: String)])
+        case recent(() -> [(input: RecentPropertyInput, summary: RecentPropertyInput.Summary)])
     }
 
     private let source: Source
@@ -54,7 +54,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     var chipsHeight: NSLayoutConstraint!
     private enum Candidate: Equatable {
         case empty(String)
-        case recent(RecentPropertyInput, String)
+        case recent(RecentPropertyInput, RecentPropertyInput.Summary)
         case tag(TagOption)
 
         var selectable: Bool {
@@ -359,7 +359,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
             candidates = tagOptions.filter { query.isEmpty || $0.name.localizedStandardContains(query) }.map(Candidate.tag)
             emptyMessage = "一致するタグがありません"
         case .recent(let inputs):
-            candidates = inputs().filter { query.isEmpty || $0.summary.localizedStandardContains(query) }
+            candidates = inputs().filter { query.isEmpty || $0.summary.text.localizedStandardContains(query) }
                 .map { .recent($0.input, $0.summary) }
             emptyMessage = query.isEmpty ? "履歴なし" : "一致する項目がありません"
         }
@@ -435,20 +435,32 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         case .empty(let message):
             return label(message, size: 12 * display.scale, color: .secondaryLabelColor)
         case .recent(_, let summary):
-            let button = QuietButton(title: summary, target: self, action: #selector(clickedCandidate(_:)))
+            let button = QuietButton(title: summary.text, target: self, action: #selector(clickedCandidate(_:)))
             button.alignment = .left
-            button.font = display.scaledFont(size: display.propertySize)
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byTruncatingTail
-            button.attributedTitle = NSAttributedString(string: summary, attributes: [
+            let normal: [NSAttributedString.Key: Any] = [
                 .foregroundColor: WriterStyle.ink,
                 .font: display.scaledFont(size: display.propertySize),
                 .paragraphStyle: paragraph
-            ])
+            ]
+            let title = NSMutableAttributedString(string: "  ", attributes: normal)
+            for option in summary.tags {
+                let colors = NotionTagColors.named(option.color)
+                var badge = normal
+                badge[.foregroundColor] = colors.foreground
+                badge[.backgroundColor] = colors.background
+                title.append(NSAttributedString(string: "\u{00a0}" + option.name + "\u{00a0}", attributes: badge))
+                title.append(NSAttributedString(string: "  ", attributes: normal))
+            }
+            let separator = "  ·  "
+            let details = summary.tags.isEmpty && summary.urls.isEmpty ? summary.text : summary.urls.joined(separator: separator)
+            title.append(NSAttributedString(string: details, attributes: normal))
+            button.attributedTitle = title
             button.cell?.lineBreakMode = .byTruncatingTail
             button.tag = row
-            button.toolTip = summary
-            button.setAccessibilityLabel(summary)
+            button.toolTip = summary.text
+            button.setAccessibilityLabel(summary.text)
             return button
         case .tag(let option):
             let button = TagCandidateButton(title: option.name, target: self, action: #selector(clickedCandidate(_:)))

@@ -10,6 +10,7 @@ enum ConversationImport {
 
     struct Prepared: @unchecked Sendable {
         let blocks: [[String: Any]]
+        let title: String
         let url: URL?
         let aiStudioBookmark: AIStudioAccess.Bookmark?
     }
@@ -51,7 +52,7 @@ enum ConversationImport {
         try Task.checkCancellation()
         let blocks = try transcript.blocks()
         guard !blocks.isEmpty else { throw WriterError.validation("取り込める本文がありません。") }
-        return Prepared(blocks: blocks, url: url, aiStudioBookmark: bookmark)
+        return Prepared(blocks: blocks, title: transcript.suggestedTitle(from: blocks), url: url, aiStudioBookmark: bookmark)
     }
 }
 
@@ -107,6 +108,6 @@ enum AIStudioAccess {
             return Transcript.Turn(speaker: role, markdown: text)
         }
         guard !turns.isEmpty else { throw invalid }
-        return Transcript(turns: turns)
+        return Transcript(turns: turns, title: root["title"] as? String)
     }
 }

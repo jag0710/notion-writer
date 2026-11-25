@@ -764,6 +764,9 @@ final class WriterPanel: NSPanel {
                 throw WriterError.validation("取り込んだ内容を本文に追加できませんでした。")
             }
             state.draft.usesTranscriptLayout = true
+            if !titleEditor.hasMarkedText(), state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                state.draft.title = prepared.title
+            }
             if let url = prepared.url, let property = state.sourceURLProperty {
                 state.draft.urls[property.id] = url.absoluteString
             }

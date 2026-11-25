@@ -77,12 +77,20 @@ struct RecentPropertyInput: Codable, Equatable {
         return input
     }
 
-    func summary(in schema: Schema) -> String {
-        let names = schema.tags.flatMap { property in
-            (tags[property.id] ?? []).compactMap { id in property.options.first { $0.id == id }?.name }
+    struct Summary: Equatable {
+        let tags: [TagOption]
+        let urls: [String]
+
+        var text: String {
+            let values = tags.map(\.name) + urls
+            return values.isEmpty ? "プロパティ入力なし" : values.joined(separator: "  ·  ")
         }
-        let addresses = schema.urls.compactMap { urls[$0.id] }
-        let values = names + addresses
-        return values.isEmpty ? "プロパティ入力なし" : values.joined(separator: "  ·  ")
+    }
+
+    func summary(in schema: Schema) -> Summary {
+        let options = schema.tags.flatMap { property in
+            (tags[property.id] ?? []).compactMap { id in property.options.first { $0.id == id } }
+        }
+        return Summary(tags: options, urls: schema.urls.compactMap { urls[$0.id] })
     }
 }

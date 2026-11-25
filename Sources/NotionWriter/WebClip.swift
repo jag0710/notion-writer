@@ -19,7 +19,8 @@ enum WebClip {
         var skippedImages = 0
     }
 
-    static func read(_ source: Source) async throws -> (title: String?, parts: [Part]) {
+    static func read(_ source: Source, loadArticle: (URL) async throws -> WebDocument = WebDocument.load)
+        async throws -> (title: String?, parts: [Part]) {
         switch source {
         case let .selection(html, base, fallback):
             if let document = WebDocument(html: html, base: base),
@@ -30,7 +31,7 @@ enum WebClip {
             if let fallback { return (nil, try MarkdownBody.blocks(fallback).map(Part.block)) }
             throw WriterError.validation("コピーした記事の書式を読み取れませんでした。")
         case .article(let url):
-            let document = try await WebDocument.load(url)
+            let document = try await loadArticle(url)
             let noteBody = document.root.firstElement {
                 $0.value("class")?.split(separator: " ").contains("note-common-styles__textnote-body") == true
             }
@@ -40,13 +41,9 @@ enum WebClip {
             guard let body else { throw WriterError.validation("記事本文を見つけられませんでした。ブラウザで本文を選択してコピーしてください。") }
             let content = parts(in: body, base: document.base)
             guard !content.isEmpty else { throw WriterError.validation("公開されている記事本文を読み取れませんでした。") }
-            let header: [Part] = [
-                .block(PagePayload.urlText(document.base ?? url)),
-                .block(block("paragraph", runs: []))
-            ]
             let heading = noteBody == nil ? nil : document.root.firstElement { $0.name == "h1" }
             let title = heading?.stringValue?.webText ?? document.title()
-            return (title.map(bracketedTitle), header + content)
+            return (title.map(bracketedTitle), content)
         }
     }
 
@@ -133,7 +130,7 @@ private struct Reader {
             }
         }
         if !runs.isEmpty || keepEmpty {
-            parts.append(.block(WebClip.block(kind, runs: runs)))
+            parts.append(.block(PagePayload.linkingBodyURLs(WebClip.block(kind, runs: runs))))
             runs.removeAll(keepingCapacity: true)
         }
         endsInSpace = false

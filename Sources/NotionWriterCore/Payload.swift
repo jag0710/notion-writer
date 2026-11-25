@@ -86,8 +86,71 @@ public enum PagePayload {
     }
 
     public static func urlText(_ url: URL) -> [String: Any] {
-        let text = ["type": "text", "text": ["content": url.absoluteString]] as [String: Any]
+        let text: [String: Any] = ["type": "text", "text": ["content": url.absoluteString, "link": ["url": url.absoluteString]]]
         return ["object": "block", "type": "paragraph", "paragraph": ["rich_text": [text]]]
+    }
+
+    private static let webURLDetector = try! NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
+    public static func linkingBodyURLs(_ block: [String: Any]) -> [String: Any] {
+        guard let type = block["type"] as? String, type != "code",
+              var content = block[type] as? [String: Any] else { return block }
+
+        func linkRuns(_ runs: [[String: Any]]) -> [[String: Any]] {
+            var result: [[String: Any]] = []
+            for (index, run) in runs.enumerated() {
+                let remaining = runs.count - index - 1
+                guard result.count + 1 + remaining <= 100, var text = run["text"] as? [String: Any],
+                      text["link"] == nil || text["link"] is NSNull,
+                      (run["annotations"] as? [String: Any])?["code"] as? Bool != true,
+                      let raw = text["content"] as? String, raw.range(of: "http", options: .caseInsensitive) != nil else {
+                    result.append(run)
+                    continue
+                }
+                let source = raw as NSString
+                var pieces: [[String: Any]] = []
+                var offset = 0
+                func append(_ range: NSRange, url: URL? = nil) {
+                    guard range.length != 0 else { return }
+                    var part = run
+                    text["content"] = source.substring(with: range)
+                    if let url { text["link"] = ["url": url.absoluteString] }
+                    else { text.removeValue(forKey: "link") }
+                    part["text"] = text
+                    pieces.append(part)
+                }
+                for match in webURLDetector.matches(in: raw, range: NSRange(location: 0, length: source.length)) {
+                    guard let url = bookmarkURL(source.substring(with: match.range)) else { continue }
+                    append(NSRange(location: offset, length: match.range.location - offset))
+                    append(match.range, url: url)
+                    offset = NSMaxRange(match.range)
+                }
+                if offset == 0 {
+                    result.append(run)
+                    continue
+                }
+                append(NSRange(location: offset, length: source.length - offset))
+                result += result.count + pieces.count + remaining <= 100 ? pieces : [run]
+            }
+            return result
+        }
+        if let runs = content["rich_text"] as? [[String: Any]] {
+            content["rich_text"] = linkRuns(runs)
+        } else if type == "table", let rows = content["children"] as? [[String: Any]] {
+            content["children"] = rows.map { row -> [String: Any] in
+                guard var rowContent = row["table_row"] as? [String: Any],
+                      let cells = rowContent["cells"] as? [[[String: Any]]] else { return row }
+                var linked = row
+                rowContent["cells"] = cells.map(linkRuns)
+                linked["table_row"] = rowContent
+                return linked
+            }
+        } else {
+            return block
+        }
+        var linked = block
+        linked[type] = content
+        return linked
     }
 
     public static func replacingLegacyBookmark(_ block: [String: Any]) -> [String: Any] {
@@ -162,7 +225,7 @@ public enum PagePayload {
         let body: [String: Any] = ["parent": ["type": "data_source_id", "data_source_id": schema.dataSourceID], "properties": properties]
         let images = Set(draft.images.map(\.id))
         let children = try bodyWithImages(draft).map { block in
-            guard let imageID = imageReferenceID(block) else { return replacingLegacyBookmark(block) }
+            guard let imageID = imageReferenceID(block) else { return linkingBodyURLs(replacingLegacyBookmark(block)) }
             guard images.contains(imageID), let uploadID = uploadedImages[imageID], UUID(uuidString: uploadID) != nil else {
                 throw WriterError.validation("画像の送信が完了していません。下書きは保持しています。")
             }

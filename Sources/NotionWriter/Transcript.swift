@@ -6,11 +6,17 @@ struct Transcript: Sendable {
         let speaker: String
         let markdown: String
         let sourceCards: [[String]]
+        let citations: [String: String]
 
-        init(speaker: String, markdown: String, sourceCards: [[String]] = []) {
+        init(speaker: String, markdown: String, sourceCards: [[String]] = [], citations: [String: String] = [:]) {
             self.speaker = speaker
             self.markdown = markdown
             self.sourceCards = sourceCards
+            self.citations = citations
+        }
+
+        var formattedMarkdown: String {
+            speaker == "user" ? markdown : TranscriptFormatting.assistantMarkdown(markdown, citations: citations)
         }
 
         var heading: String? {
@@ -26,6 +32,34 @@ struct Transcript: Sendable {
     }
 
     let turns: [Turn]
+    let title: String?
+
+    init(turns: [Turn], title: String? = nil) {
+        self.turns = turns
+        self.title = title
+    }
+
+    func suggestedTitle(from blocks: [[String: Any]]) -> String {
+        if let title = title?.webText { return Self.limitTitle(title) }
+        let speakerLabels = Set(turns.compactMap(\.heading))
+        for block in blocks {
+            guard let type = block["type"] as? String, type != "code",
+                  let content = block[type] as? [String: Any],
+                  let runs = content["rich_text"] as? [[String: Any]] else { continue }
+            let text = runs.compactMap { ($0["text"] as? [String: Any])?["content"] as? String }.joined()
+            for line in text.split(whereSeparator: \.isNewline) {
+                if let lead = String(line).webText, !speakerLabels.contains(lead) {
+                    return Self.limitTitle(lead)
+                }
+            }
+        }
+        return "取り込んだ文章"
+    }
+
+    private static func limitTitle(_ text: String) -> String {
+        let prefix = String(text.prefix(80))
+        return prefix == text ? prefix : prefix + "…"
+    }
 
     private static func sourceBlock(_ card: [String]) -> [String: Any] {
         let title = card.prefix(2).joined(separator: " — ")
@@ -42,7 +76,7 @@ struct Transcript: Sendable {
 
     func blocks() throws -> [[String: Any]] {
         try turns.flatMap { turn in
-            var body = try MarkdownBody.blocks(turn.markdown)
+            var body = try MarkdownBody.blocks(turn.formattedMarkdown)
             if !turn.sourceCards.isEmpty {
                 body += try MarkdownBody.blocks("### 出典")
                 body += turn.sourceCards.map(Self.sourceBlock)

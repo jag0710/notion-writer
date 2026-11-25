@@ -482,6 +482,12 @@ import NotionWriterCore
         updated?()
     }
 
+    private var conversationTag: (property: WriterProperty, option: TagOption)? {
+        guard let property = visibleSchema.tags.first(where: { $0.name == "雑記" }),
+              let option = property.options.first(where: { $0.name == "AI" }) else { return nil }
+        return (property, option)
+    }
+
     func addConversation(_ source: ConversationImport.Source,
                          loadChat: @escaping @Sendable (ConversationLink) async throws -> Transcript,
                          insert: (ConversationImport.Prepared) throws -> Void) async -> Bool {
@@ -495,8 +501,16 @@ import NotionWriterCore
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try await ConversationImport.prepare(source, loadChat: loadChat)
             }.value
+            if conversationTag == nil, connection != nil,
+               schema == nil || visibleSchema.tags.contains(where: { $0.name == "雑記" }) {
+                await sync()
+            }
             try Task.checkCancellation()
             try insert(prepared)
+            if let (property, option) = conversationTag,
+               !(draft.tags[property.id] ?? []).contains(option.id) {
+                draft.tags[property.id, default: []].append(option.id)
+            }
             try flush()
             status = "本文に取り込みました"
             if let bookmark = prepared.aiStudioBookmark {

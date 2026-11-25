@@ -93,6 +93,26 @@ enum ChatShare {
         let conversation = record(response["data"])
         guard let timeline = value(conversation["linear_conversation"]) as? [Any] else { return nil }
 
+        var citations: [String: String] = [:]
+        for entry in timeline {
+            let metadata = record(record(record(entry)["message"])["metadata"])
+            for group in value(metadata["search_result_groups"]) as? [Any] ?? [] {
+                for source in value(record(group)["entries"]) as? [Any] ?? [] {
+                    let result = record(source)
+                    let reference = record(result["ref_id"])
+                    guard let turn = value(reference["turn_index"]) as? Int,
+                          let kind = value(reference["ref_type"]) as? String,
+                          let index = value(reference["ref_index"]) as? Int,
+                          let address = value(result["url"]) as? String,
+                          let url = PagePayload.bookmarkURL(address),
+                          let label = (value(result["source_name"]) as? String)?.webText ?? url.host else { continue }
+                    let escaped = label.replacingOccurrences(of: "\\", with: "\\\\")
+                        .replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
+                    citations["turn\(turn)\(kind)\(index)"] = "[\(escaped)](<\(url.absoluteString)>)"
+                }
+            }
+        }
+
         let turns: [Transcript.Turn] = timeline.compactMap { entry in
             let message = record(record(entry)["message"])
             let author = record(message["author"])
@@ -105,13 +125,12 @@ enum ChatShare {
             let parts = value(content["parts"]) as? [Any] ?? []
             let strings = parts.flatMap { visible($0) }
             let text = (strings.isEmpty ? TranscriptFormatting.widgetFields.flatMap { visible(content[$0]) } : strings)
-                .map(TranscriptFormatting.assistantMarkdown)
                 .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 .joined(separator: "\n\n")
-            return text.isEmpty ? nil : Transcript.Turn(speaker: role, markdown: text)
+            return text.isEmpty ? nil : Transcript.Turn(speaker: role, markdown: text, citations: citations)
         }
         guard !turns.isEmpty else { return nil }
-        return Transcript(turns: turns)
+        return Transcript(turns: turns, title: value(conversation["title"]) as? String)
     }
 }
 

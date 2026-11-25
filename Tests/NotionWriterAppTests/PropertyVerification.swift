@@ -99,9 +99,18 @@ func verifyVideoAndPropertyRecall(root: URL) async throws {
     let selectedView = row.tableView(row.table, rowViewForRow: 0)
     selectedView?.isSelected = true
     let selectedButton = row.tableView(row.table, viewFor: row.table.tableColumns.first, row: 0) as? NSButton
+    let title = selectedButton?.attributedTitle ?? NSAttributedString()
+    let character = (title.string as NSString).range(of: "キャラクター")
+    let idea = (title.string as NSString).range(of: "アイディア雑記")
+    let address = (title.string as NSString).range(of: "https://example.com/11")
     try require(selectedView?.interiorBackgroundStyle == .normal &&
-                selectedButton?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == WriterStyle.ink,
-                "Recent items lost their dark text on the light selection highlight")
+                character.location != NSNotFound && idea.location != NSNotFound && address.location != NSNotFound &&
+                title.attribute(.backgroundColor, at: character.location, effectiveRange: nil) as? NSColor ==
+                    NotionTagColors.named("blue").background &&
+                title.attribute(.backgroundColor, at: idea.location, effectiveRange: nil) as? NSColor ==
+                    NotionTagColors.named("yellow").background &&
+                title.attribute(.foregroundColor, at: address.location, effectiveRange: nil) as? NSColor == WriterStyle.ink,
+                "Recent items lost their tag palette or URL contrast")
     let editor = NSTextView()
     try require(row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.moveUp(_:))) &&
                 row.table.selectedRow == row.table.numberOfRows - 1, "Up did not wrap to the last candidate")
