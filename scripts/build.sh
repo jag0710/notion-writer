@@ -4,13 +4,12 @@ cd "$(dirname "$0")/.."
 BUNDLE_ID="io.github.jag0710.notion-writer"
 APP_NAME="Notion Writer"
 DISPLAY_NAME="$APP_NAME"
-VERSION="1.2.0"
-BUNDLE_VERSION="9"
+VERSION="1.3.0"
+BUNDLE_VERSION="12"
 if [[ $# -eq 1 && "$1" == --trial ]]; then
     BUNDLE_ID="$BUNDLE_ID.trial"
     APP_NAME="Notion Writer Trial"
     DISPLAY_NAME="Notion Writer 試験版"
-    BUNDLE_VERSION="11"
 elif [[ $# -ne 0 ]]; then
     printf 'Usage: %s [--trial]\n' "$0" >&2
     exit 2
