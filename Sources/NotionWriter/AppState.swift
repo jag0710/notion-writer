@@ -22,6 +22,15 @@ import NotionWriterCore
     var saved: (() -> Void)?
     var submissionFailed: (() -> Void)?
     private(set) var recentSends: [SendRecord]
+    private var recentPropertiesByDestination: [String: [RecentPropertyInput]]
+
+    var recentPropertyInputs: [RecentPropertyInput] {
+        guard let connection else { return [] }
+        let key = store.draftName(for: connection)
+        if let inputs = recentPropertiesByDestination[key] { return inputs }
+        return recentSends.lazy.filter { $0.destination.connection == connection }
+            .prefix(RecentPropertyInput.limit).map { RecentPropertyInput(draft: $0.draft) }
+    }
     private(set) var sendingID: UUID?
     private(set) var historyFeedback: String?
     private var aiStudioFiles: [String: Data]
@@ -37,6 +46,11 @@ import NotionWriterCore
     }
     let qa: Bool
     var visibleSchema: Schema { schema ?? .demo }
+    var sourceURLProperty: WriterProperty? {
+        let properties = visibleSchema.urls
+        return properties.first { $0.name.caseInsensitiveCompare("URL") == .orderedSame }
+            ?? (properties.count == 1 ? properties.first : nil)
+    }
     init(qa: Bool, dataRoot: URL? = nil, exclusiveStore: Bool = false, clientOverride: (() throws -> NotionClient)? = nil,
          preferences: UserDefaults = .standard) throws {
         self.clientOverride = clientOverride
@@ -62,6 +76,8 @@ import NotionWriterCore
         schema = try local.read(Schema.self, name: cacheName(storedConnection))
         draft = try local.read(Draft.self, name: local.draftName(for: storedConnection)) ?? Draft()
         recentSends = Array(try SendRecord.load(from: local, destination: destination).prefix(historyLimit))
+        recentPropertiesByDestination = (try? local.read([String: [RecentPropertyInput]].self,
+                                                         name: RecentPropertyInput.filename)) ?? [:]
         if draft.submissionPending { status = pendingSaveMessage }
         else if let target = activeDestination { status = target.name + " · キャッシュを表示中" }
     }
@@ -251,8 +267,16 @@ import NotionWriterCore
             record.draft.pendingPageID = nil
             record.result = .failed
             record.pageID = nil
+            let previousInputs = recentPropertyInputs
             try saveRecord(record)
             if tracksEditor { try writeEditor(record.draft) }
+            if !fromHistory {
+                let input = RecentPropertyInput(draft: record.draft)
+                var next = recentPropertiesByDestination
+                next[store.draftName(for: target.connection)] = Array(([input] + previousInputs).prefix(RecentPropertyInput.limit))
+                try store.write(next, name: RecentPropertyInput.filename)
+                recentPropertiesByDestination = next
+            }
             busy = true
             accepted = true
             sendingID = record.id
@@ -396,6 +420,54 @@ import NotionWriterCore
                 : "Webの内容を取り込みました。取得できなかった画像\(content.skippedImages)枚はリンクで残しています。"
         } catch {
             status = "Webの内容を取り込めませんでした。 " + error.localizedDescription
+        }
+    }
+
+    func addVideo(_ url: URL, loadTitle: (YouTubeVideo) async throws -> String = { try await $0.loadTitle() },
+                  canReplaceTitle: () -> Bool) async {
+        guard !busy, !importingImages, !changingDestination, !draft.submissionPending else { return }
+        let originalTitle = draft.title
+        let originalURLProperty = sourceURLProperty?.id
+        let originalURL = originalURLProperty.flatMap { draft.urls[$0] }
+        importingImages = true
+        status = "動画を取り込み中…"
+        updated?()
+        defer { importingImages = false; updated?() }
+
+        do {
+            let video = try YouTubeVideo(url: url)
+            let title = try await loadTitle(video)
+            try Task.checkCancellation()
+            let urlProperty = sourceURLProperty?.id
+            let currentURL = urlProperty.flatMap { draft.urls[$0] }
+            guard canReplaceTitle(), draft.title == originalTitle, currentURL == originalURL,
+                  (originalURLProperty == nil || originalURLProperty == urlProperty) else {
+                throw WriterError.validation("タイトルまたはURLが編集中に変わりました。動画をもう一度取り込んでください。")
+            }
+            var next = draft
+            next.title = title
+            var missing: [String] = []
+            if let urlProperty {
+                next.urls[urlProperty] = video.sourceURL.absoluteString
+            } else {
+                missing.append("URL")
+            }
+            let matches = visibleSchema.tags.flatMap { property in
+                property.options.filter { $0.name == "ネット収集情報" }.map { (property.id, $0.id) }
+            }
+            if matches.count == 1, let (propertyID, optionID) = matches.first {
+                if !(next.tags[propertyID] ?? []).contains(optionID) {
+                    next.tags[propertyID, default: []].append(optionID)
+                }
+            } else {
+                missing.append("ネット収集情報")
+            }
+            next.submissionID = nil
+            try writeEditor(next)
+            status = missing.isEmpty ? "動画を取り込みました"
+                : "動画を取り込みました。未入力: " + missing.joined(separator: "、")
+        } catch {
+            status = error.localizedDescription
         }
     }
 

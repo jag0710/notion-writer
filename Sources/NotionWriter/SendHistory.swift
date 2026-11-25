@@ -51,3 +51,38 @@ struct SendRecord: Codable, Equatable, Identifiable {
         let savedAt: Date
     }
 }
+
+struct RecentPropertyInput: Codable, Equatable {
+    static let filename = "recent-property-inputs"
+    static let limit = 10
+
+    var tags: [String: [String]]
+    var urls: [String: String]
+
+    init(draft: Draft) {
+        tags = draft.tags.filter { !$0.value.isEmpty }
+        urls = draft.urls.filter { !$0.value.isEmpty }
+    }
+
+    func available(in schema: Schema) -> Self {
+        var input = self
+        input.tags = [:]
+        for property in schema.tags {
+            let optionIDs = Set(property.options.map(\.id))
+            let selected = (tags[property.id] ?? []).filter { optionIDs.contains($0) }
+            if !selected.isEmpty { input.tags[property.id] = selected }
+        }
+        let urlIDs = Set(schema.urls.map(\.id))
+        input.urls = urls.filter { urlIDs.contains($0.key) }
+        return input
+    }
+
+    func summary(in schema: Schema) -> String {
+        let names = schema.tags.flatMap { property in
+            (tags[property.id] ?? []).compactMap { id in property.options.first { $0.id == id }?.name }
+        }
+        let addresses = schema.urls.compactMap { urls[$0.id] }
+        let values = names + addresses
+        return values.isEmpty ? "プロパティ入力なし" : values.joined(separator: "  ·  ")
+    }
+}

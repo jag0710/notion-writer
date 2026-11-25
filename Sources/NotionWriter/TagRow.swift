@@ -44,7 +44,23 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     private let selectedDocument = FlippedDocumentView()
     private var selectedHeight: NSLayoutConstraint!
     var chipsHeight: NSLayoutConstraint!
-    var options: [TagOption] = []
+    private enum Candidate: Equatable {
+        case heading, emptyHistory, emptySearch
+        case recent(RecentPropertyInput, String)
+        case tag(TagOption)
+
+        var selectable: Bool {
+            switch self {
+            case .recent, .tag: return true
+            default: return false
+            }
+        }
+    }
+
+    private var candidates: [Candidate] = []
+    var recentInputs: (() -> [(RecentPropertyInput, String)])?
+    var recall: ((RecentPropertyInput) -> Void)?
+    var exitToTitle: (() -> Void)?
     var selection: [String]
     var changed: (([String]) -> Void)?
     var move: ((Bool) -> Void)?
@@ -185,7 +201,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
             let widest = property.options.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
             measuredCandidateWidth = max(baseWidth, ceil(widest + 76 * display.scale + 15))
         }
-        let visibleRows = min(14, max(7, property.options.count))
+        let visibleRows = min(14, max(7, candidates.count))
         let preferredHeight = table.rowHeight * CGFloat(visibleRows) + 110 * display.scale
         let geometry = TagMenuLayout(screen: screen, width: measuredCandidateWidth ?? baseWidth,
                                      height: min(preferredHeight, screen.height * 0.72))
@@ -297,19 +313,30 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         filter(preserveNavigation: preserveNavigation); layoutChanged?()
     }
     func filter(preserveNavigation: Bool = false) {
-        let selectedID = options.indices.contains(table.selectedRow) ? options[table.selectedRow].id : nil
+        let selected = candidates.indices.contains(table.selectedRow) ? candidates[table.selectedRow] : nil
         let previousOrigin = scroll.contentView.bounds.origin
-        options = property.options.filter { search.stringValue.isEmpty || $0.name.localizedStandardContains(search.stringValue) }
+        let query = search.stringValue
+        let tags = property.options.filter { query.isEmpty || $0.name.localizedStandardContains(query) }
+        candidates = tags.isEmpty ? [.emptySearch] : tags.map(Candidate.tag)
+        if query.isEmpty, let recentInputs {
+            let inputs = recentInputs()
+            let history: [Candidate] = inputs.isEmpty ? [.emptyHistory] : inputs.map { .recent($0.0, $0.1) }
+            candidates.insert(contentsOf: [.heading] + history, at: 0)
+        }
         table.reloadData()
-        if !options.isEmpty {
-            let selectedRow = preserveNavigation ? options.firstIndex { $0.id == selectedID } ?? 0 : 0
-            table.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+        let preserved = preserveNavigation ? selected.flatMap { candidates.firstIndex(of: $0) } : nil
+        if let row = preserved ?? candidates.firstIndex(where: \.selectable) {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            table.deselectAll(nil)
         }
         if preserveNavigation {
             let clip = scroll.contentView
             let bounds = clip.constrainBoundsRect(NSRect(origin: previousOrigin, size: clip.bounds.size))
             clip.scroll(to: bounds.origin); scroll.reflectScrolledClipView(clip)
-        } else if !options.isEmpty { table.scrollRowToVisible(0) }
+        } else {
+            table.scrollRowToVisible(0)
+        }
     }
     @objc func clickedCandidate(_ sender: NSButton) { choose(sender.tag) }
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -317,11 +344,17 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
     }
     @objc func clicked() { if table.clickedRow >= 0 { choose(table.clickedRow) } }
     func choose(_ row: Int) {
-        guard options.indices.contains(row) else { NSSound.beep(); return }
-        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        let id = options[row].id
-        if selection.contains(id) { selection.removeAll { $0 == id } } else { selection.append(id) }
-        selectionChanged()
+        guard candidates.indices.contains(row), candidates[row].selectable else { NSSound.beep(); return }
+        switch candidates[row] {
+        case .recent(let input, _):
+            recall?(input)
+        case .tag(let tag):
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            if selection.contains(tag.id) { selection.removeAll { $0 == tag.id } } else { selection.append(tag.id) }
+            selectionChanged()
+        default:
+            break
+        }
     }
     private func selectionChanged() {
         refresh(preserveNavigation: true)
@@ -333,10 +366,19 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         if textView.hasMarkedText() { return false }
         switch selector {
         case #selector(NSResponder.moveDown(_:)), #selector(NSResponder.moveUp(_:)):
-            guard !options.isEmpty else { return true }
-            let delta = selector == #selector(NSResponder.moveDown(_:)) ? 1 : -1
-            let row = max(0, min(options.count - 1, table.selectedRow + delta))
-            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false); table.scrollRowToVisible(row); return true
+            let rows = candidates.indices.filter { candidates[$0].selectable }
+            guard !rows.isEmpty else { return true }
+            let forward = selector == #selector(NSResponder.moveDown(_:))
+            let offset = rows.firstIndex(of: table.selectedRow) ?? (forward ? -1 : rows.count)
+            let row = rows[(offset + (forward ? 1 : -1) + rows.count) % rows.count]
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table.scrollRowToVisible(row)
+            return true
+        case #selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:)),
+             #selector(NSResponder.moveBackward(_:)), #selector(NSResponder.moveForward(_:)):
+            collapse()
+            exitToTitle?()
+            return true
         case #selector(NSResponder.insertNewline(_:)): choose(table.selectedRow); return true
         case #selector(NSResponder.insertTab(_:)): collapse(); move?(false); return true
         case #selector(NSResponder.insertBacktab(_:)): collapse(); move?(true); return true
@@ -345,15 +387,35 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         }
     }
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { CandidateRow() }
-    func numberOfRows(in tableView: NSTableView) -> Int { max(1, options.count) }
+    func numberOfRows(in tableView: NSTableView) -> Int { candidates.count }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { candidates[row].selectable }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard options.indices.contains(row) else { return label("一致するタグがありません", size: 12, color: .secondaryLabelColor) }
-        let option = options[row]
-        let button = TagCandidateButton(title: option.name, target: self, action: #selector(clickedCandidate(_:)))
-        button.chosen = selection.contains(option.id); button.scale = display.scale; button.tagColor = option.color
-        button.tag = row; button.font = display.scaledFont(size: display.propertySize); button.toolTip = option.name
-        button.setAccessibilityLabel(option.name + (button.chosen ? " 選択済み" : ""))
-        return button
+        switch candidates[row] {
+        case .heading:
+            let heading = label("最近の入力", size: 12 * display.scale, color: .secondaryLabelColor)
+            heading.font = .systemFont(ofSize: 12 * display.scale, weight: .semibold)
+            return heading
+        case .emptyHistory:
+            return label("履歴なし", size: 12 * display.scale, color: .secondaryLabelColor)
+        case .emptySearch:
+            return label("一致するタグがありません", size: 12 * display.scale, color: .secondaryLabelColor)
+        case .recent(_, let summary):
+            let button = QuietButton(title: summary, target: self, action: #selector(clickedCandidate(_:)))
+            button.alignment = .left
+            button.font = display.scaledFont(size: display.propertySize)
+            button.contentTintColor = WriterStyle.ink
+            button.cell?.lineBreakMode = .byTruncatingTail
+            button.tag = row
+            button.toolTip = summary
+            button.setAccessibilityLabel(summary)
+            return button
+        case .tag(let option):
+            let button = TagCandidateButton(title: option.name, target: self, action: #selector(clickedCandidate(_:)))
+            button.chosen = selection.contains(option.id); button.scale = display.scale; button.tagColor = option.color
+            button.tag = row; button.font = display.scaledFont(size: display.propertySize); button.toolTip = option.name
+            button.setAccessibilityLabel(option.name + (button.chosen ? " 選択済み" : ""))
+            return button
+        }
     }
 }
 

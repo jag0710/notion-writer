@@ -31,6 +31,7 @@ final class OfflineProtocol: URLProtocol {
     static var pageRequests = 0
     static var schemaRequests = 0
     static var conversationSchema = false
+    static var propertyRecallSchema = false
     static var pagePayload: Data?
     static var pageParentOverride: [String: String]?
     static var moveAfterFirstAppend = false
@@ -56,10 +57,20 @@ final class OfflineProtocol: URLProtocol {
             }
         } else if path.contains("data_sources/") {
             let target = Self.alternateDestination.flatMap { path.hasSuffix($0.dataSourceID) ? $0 : nil } ?? TestDestination.target
-            var properties = ["名前": ["id": "title", "name": "名前", "type": "title"]]
+            var properties: [String: [String: Any]] = ["名前": ["id": "title", "name": "名前", "type": "title"]]
             if Self.conversationSchema {
                 properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
                 properties["別のリンク"] = ["id": "other", "name": "別のリンク", "type": "url"]
+            }
+            if Self.propertyRecallSchema {
+                properties["URL"] = ["id": "url", "name": "URL", "type": "url"]
+                properties["資料"] = ["id": "reference", "name": "資料", "type": "multi_select",
+                                     "multi_select": ["options": [
+                                        ["id": "web", "name": "ネット収集情報", "color": "green"],
+                                        ["id": "character", "name": "キャラクター", "color": "blue"]]]]
+                properties["雑記"] = ["id": "notes", "name": "雑記", "type": "multi_select",
+                                     "multi_select": ["options": [
+                                        ["id": "idea", "name": "アイディア雑記", "color": "yellow"]]]]
             }
             value = TestDestination.source(target, properties: properties)
         } else if path.contains("views/") {
@@ -342,7 +353,17 @@ final class OfflineProtocol: URLProtocol {
             writer.submit()
             try require(OfflineProtocol.pageRequests == 0, "IME composition triggered save")
             writer.titleEditor.unmarkText()
-            print("PASS: marked Japanese input survives update and prevents premature save")
+            writer.titleEditor.string = ""
+            writer.fitContent()
+            let singleLine = writer.titleHeight.constant
+            let longComposition = String(repeating: "にほんごのへんかんちゅう", count: 12)
+            writer.titleEditor.setMarkedText(longComposition,
+                                             selectedRange: NSRange(location: longComposition.utf16.count, length: 0),
+                                             replacementRange: NSRange(location: NSNotFound, length: 0))
+            try require(writer.titleEditor.hasMarkedText() && writer.titleHeight.constant > singleLine,
+                        "Title failed to expand while wrapped Japanese input was still marked")
+            writer.titleEditor.unmarkText()
+            print("PASS: marked Japanese input expands the title, survives update and prevents premature save")
 
             let displayFrame = NSRect(x: -1280, y: 160, width: 1280, height: 768)
             let centeredMenu = TagMenuLayout(screen: displayFrame, width: 560, height: 480).frame
@@ -631,6 +652,7 @@ final class OfflineProtocol: URLProtocol {
             try await verifyHistoryRetries(root: root)
             try await verifyHistoryLimit(root: root)
             try await verifyConversationImport(root: root)
+            try await verifyVideoAndPropertyRecall(root: root)
             print("PASS: app-level verification used isolated temporary data and offline transport")
         } catch { print("FAIL: \(error)"); exit(1) }
     }

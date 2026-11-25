@@ -10,6 +10,18 @@ class WriterTextView: NSTextView {
     var tab: ((Bool) -> Void)?
     var save: (() -> Void)?
     var dismiss: (() -> Void)?
+    var compositionChanged: (() -> Void)?
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        compositionChanged?()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        compositionChanged?()
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         if string.isEmpty {
@@ -84,9 +96,11 @@ final class WriterPanel: NSPanel {
     private var bodyLoadError: String?
     let imageButton = QuietButton(title: "画像を追加", target: nil, action: nil)
     private let articleButton = QuietButton(title: "記事を取り込む", target: nil, action: nil)
+    private let videoButton = QuietButton(title: "動画を取り込む", target: nil, action: nil)
     private let conversationButton = QuietButton(title: "対話を取り込む", target: nil, action: nil)
     private let fullTextButton = QuietButton(title: "全文を取り込む", target: nil, action: nil)
     private lazy var articlePrompt = ImportURLPrompt(title: "記事を取り込む", instruction: "公開記事のURLを入力してください。", fieldLabel: "記事のURL")
+    private lazy var videoPrompt = ImportURLPrompt(title: "動画を取り込む", instruction: "YouTubeの動画URLを入力してください。", fieldLabel: "動画のURL")
     private lazy var conversationPrompt = ImportURLPrompt(title: "対話を取り込む", instruction: "URLを貼り付けて下さい", fieldLabel: "対話のURL")
     private lazy var fullTextPrompt = FullTextPrompt()
     let imageCount = label("", size: 11, color: .secondaryLabelColor)
@@ -131,6 +145,11 @@ final class WriterPanel: NSPanel {
         titleEditor.setAccessibilityLabel("文章（Notionのタイトル）"); titleEditor.string = state.draft.title
         titleEditor.tab = { [weak self] back in self?.focusProperty(back ? ((self?.tagRows.count ?? 0) + (self?.urlFields.count ?? 0) - 1) : 0) }
         titleEditor.dismiss = { [weak self] in self?.hide() }
+        titleEditor.compositionChanged = { [weak self] in
+            guard let self, !resettingDraft else { return }
+            fitContent()
+            titleEditor.scrollRangeToVisible(titleEditor.selectedRange())
+        }
         root.addArrangedSubview(titleScroll); titleScroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         properties.translatesAutoresizingMaskIntoConstraints = false
         let document = FlippedDocumentView(); document.translatesAutoresizingMaskIntoConstraints = false; document.addSubview(properties)
@@ -140,7 +159,8 @@ final class WriterPanel: NSPanel {
         root.addArrangedSubview(propertyScroll); propertyScroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         let actions = scaledStack(stack(.horizontal, spacing: 16))
         for (button, action) in [(bodyButton, #selector(toggleBody)), (imageButton, #selector(addImages)),
-                                 (articleButton, #selector(addArticle)), (conversationButton, #selector(addConversation)),
+                                 (articleButton, #selector(addArticle)), (videoButton, #selector(addVideo)),
+                                 (conversationButton, #selector(addConversation)),
                                  (fullTextButton, #selector(addFullText))] {
             button.target = self
             button.action = action
@@ -244,6 +264,7 @@ final class WriterPanel: NSPanel {
         let actionSymbol = NSImage.SymbolConfiguration(pointSize: 12 * scale, weight: .regular)
         imageButton.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         articleButton.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
+        videoButton.image = NSImage(systemSymbolName: "play.rectangle", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         conversationButton.image = NSImage(systemSymbolName: "bubble.left.and.bubble.right", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         fullTextButton.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: nil)?.withSymbolConfiguration(actionSymbol)
         let footerFont = state.display.scaledFont(size: 11)
@@ -327,16 +348,48 @@ final class WriterPanel: NSPanel {
         guard !textView.hasMarkedText(), let field = control as? NSTextField, let index = urlFields.firstIndex(of: field) else { return false }
         if selector == #selector(NSResponder.insertTab(_:)) { focusProperty(tagRows.count + index + 1); return true }
         if selector == #selector(NSResponder.insertBacktab(_:)) { focusProperty(tagRows.count + index - 1); return true }
-        return false
+        switch selector {
+        case #selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:)),
+             #selector(NSResponder.moveBackward(_:)), #selector(NSResponder.moveForward(_:)):
+            focusTitle()
+            return true
+        case #selector(NSResponder.moveUp(_:)), #selector(NSResponder.moveDown(_:)):
+            let count = tagRows.count + urlFields.count
+            let delta = selector == #selector(NSResponder.moveUp(_:)) ? -1 : 1
+            focusProperty((tagRows.count + index + delta + count) % count)
+            return true
+        default:
+            return false
+        }
     }
     func focusProperty(_ index: Int) {
         tagRows.forEach { $0.collapse() }
         if tagRows.indices.contains(index) {
             let row = tagRows[index]; row.focus(); row.scrollToVisible(row.bounds)
-        } else if urlFields.indices.contains(index - tagRows.count) { window?.makeFirstResponder(urlFields[index - tagRows.count]) }
+        } else if urlFields.indices.contains(index - tagRows.count) {
+            let field = urlFields[index - tagRows.count]
+            field.scrollToVisible(field.bounds)
+            window?.makeFirstResponder(field)
+        }
         else if index >= tagRows.count + urlFields.count && bodyExpanded { window?.makeFirstResponder(bodyEditor) }
         else { window?.makeFirstResponder(titleEditor) }
     }
+    private func focusTitle() {
+        tagRows.forEach { $0.collapse() }
+        window?.makeKey()
+        window?.makeFirstResponder(titleEditor)
+    }
+
+    func applyRecentPropertyInput(_ input: RecentPropertyInput) {
+        guard titleEditor.isEditable, !state.importingImages else { return }
+        let available = input.available(in: state.visibleSchema)
+        state.draft.tags = available.tags
+        state.draft.urls = available.urls
+        state.edited()
+        update()
+        focusTitle()
+    }
+
     func update() {
         if loadedDraftRevision != state.draftRevision {
             loadedDraftRevision = state.draftRevision
@@ -387,6 +440,7 @@ final class WriterPanel: NSPanel {
             bodyButton.font = state.display.scaledFont(size: state.display.propertySize)
             imageButton.font = bodyButton.font
             articleButton.font = bodyButton.font
+            videoButton.font = bodyButton.font
             conversationButton.font = bodyButton.font
             fullTextButton.font = bodyButton.font
             renderedDisplay = state.display
@@ -404,6 +458,7 @@ final class WriterPanel: NSPanel {
         bodyEditor.isEditable = titleEditor.isEditable && !state.importingImages && bodyLoadError == nil
         imageButton.isEnabled = bodyEditor.isEditable
         articleButton.isEnabled = bodyEditor.isEditable
+        videoButton.isEnabled = titleEditor.isEditable && !state.importingImages
         conversationButton.isEnabled = bodyEditor.isEditable
         fullTextButton.isEnabled = bodyEditor.isEditable
     }
@@ -466,6 +521,13 @@ final class WriterPanel: NSPanel {
             let row = TagRow(property: property, selection: state.draft.tags[property.id] ?? [], display: state.display)
             row.saveRequested = { [weak self] in self?.submit() }
             row.activated = { [weak self] in self?.focusProperty(index) }
+            row.exitToTitle = { [weak self] in self?.focusTitle() }
+            row.recentInputs = { [weak self] in
+                guard let self else { return [] }
+                let schema = state.visibleSchema
+                return state.recentPropertyInputs.map { ($0, $0.summary(in: schema)) }
+            }
+            row.recall = { [weak self] input in self?.applyRecentPropertyInput(input) }
             row.layoutChanged = { [weak self] in self?.fitContent() }
             row.changed = { [weak self] values in
                 guard let self else { return }
@@ -516,6 +578,18 @@ final class WriterPanel: NSPanel {
         Task { await state.addImageData(data) { try insertImages($0, at: caret) } }
     }
 
+    @objc private func addVideo() {
+        guard let window, window.attachedSheet == nil, videoButton.isEnabled,
+              (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
+        tagRows.forEach { $0.collapse() }
+        videoPrompt.show(in: window) { [weak self] url in
+            Task {
+                guard let self else { return }
+                await self.state.addVideo(url) { !self.titleEditor.hasMarkedText() }
+            }
+        }
+    }
+
     @objc private func addArticle() {
         guard let window, window.attachedSheet == nil, bodyEditor.isEditable,
               (window.firstResponder as? NSTextView)?.hasMarkedText() != true else { return }
@@ -559,16 +633,10 @@ final class WriterPanel: NSPanel {
             state.draft.title = title
             titleEditor.string = title
         }
-        if let property = sourceURLProperty,
+        if let property = state.sourceURLProperty,
            (state.draft.urls[property.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             state.draft.urls[property.id] = url.absoluteString
         }
-    }
-
-    private var sourceURLProperty: WriterProperty? {
-        let properties = state.visibleSchema.urls
-        return properties.first { $0.name.caseInsensitiveCompare("URL") == .orderedSame }
-            ?? (properties.count == 1 ? properties.first : nil)
     }
 
     @objc func addConversation() {
@@ -668,7 +736,7 @@ final class WriterPanel: NSPanel {
                 throw WriterError.validation("取り込んだ内容を本文に追加できませんでした。")
             }
             state.draft.usesTranscriptLayout = true
-            if let url = prepared.url, let property = sourceURLProperty {
+            if let url = prepared.url, let property = state.sourceURLProperty {
                 state.draft.urls[property.id] = url.absoluteString
             }
             bodyExpanded = true

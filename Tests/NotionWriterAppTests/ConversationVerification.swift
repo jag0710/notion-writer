@@ -10,7 +10,7 @@ extension AppVerification {
         await state.sync()
         let writer = WriterWindow(state: state)
         let window = writer.window!
-        let buttons = ["本文を追加", "画像を追加", "記事を取り込む", "対話を取り込む", "全文を取り込む"]
+        let buttons = ["本文を追加", "画像を追加", "記事を取り込む", "動画を取り込む", "対話を取り込む", "全文を取り込む"]
         func containsActionRow(_ view: NSView) -> Bool {
             if let row = view as? NSStackView, row.orientation == .horizontal {
                 let labels = row.arrangedSubviews.compactMap { ($0 as? NSButton)?.title }
