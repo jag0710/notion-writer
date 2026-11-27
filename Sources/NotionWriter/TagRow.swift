@@ -10,11 +10,57 @@ func stack(_ orientation: NSUserInterfaceLayoutOrientation, spacing: CGFloat = 8
     return view
 }
 final class CandidateRow: NSTableRowView {
+    private let selectable: Bool
+    private var hoverTracking: NSTrackingArea?
+    private(set) var isHovered = false {
+        didSet { if oldValue != isHovered { needsDisplay = true } }
+    }
+
+    init(selectable: Bool) {
+        self.selectable = selectable
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        guard selectable else { return }
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                      owner: self)
+        addTrackingArea(tracking)
+        hoverTracking = tracking
+        isHovered = window.map {
+            $0.isKeyWindow && visibleRect.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil))
+        } ?? false
+    }
+
+    override func mouseEntered(with event: NSEvent) { if selectable { isHovered = true } }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { isHovered = false }
+    }
+
+    private var highlightPath: NSBezierPath {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5)
+    }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        super.drawBackground(in: dirtyRect)
+        if isHovered && !isSelected {
+            NSColor.labelColor.withAlphaComponent(0.08).setFill()
+            highlightPath.fill()
+        }
+    }
+
     // The custom selection stays light, so controls should keep their normal text colors.
     override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
     override func drawSelection(in dirtyRect: NSRect) {
         NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 4, dy: 1), xRadius: 5, yRadius: 5).fill()
+        highlightPath.fill()
         NSColor.controlAccentColor.setFill()
         NSBezierPath(roundedRect: NSRect(x: 0, y: 5, width: 2, height: bounds.height - 10), xRadius: 1, yRadius: 1).fill()
     }
@@ -427,7 +473,9 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
         default: return false
         }
     }
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { CandidateRow() }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        CandidateRow(selectable: candidates[row].selectable)
+    }
     func numberOfRows(in tableView: NSTableView) -> Int { candidates.count }
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { candidates[row].selectable }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -436,6 +484,7 @@ final class TagRow: NSStackView, NSSearchFieldDelegate, NSTableViewDataSource, N
             return label(message, size: 12 * display.scale, color: .secondaryLabelColor)
         case .recent(_, let summary):
             let button = QuietButton(title: summary.text, target: self, action: #selector(clickedCandidate(_:)))
+            button.highlightsOnHover = false
             button.alignment = .left
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byTruncatingTail

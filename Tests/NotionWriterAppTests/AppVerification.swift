@@ -157,6 +157,7 @@ final class OfflineProtocol: URLProtocol {
                 try await verifyConversationSamples(Array(CommandLine.arguments.dropFirst(2)), root: root)
                 return
             }
+            try await verifyEditorUndo(root: root)
             let state = try state(root: root)
             state.draft.title = "日本語\n\n絵文字🎷\n"
             state.draft.body = "## 見出し\n- **太字**"
