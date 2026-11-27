@@ -10,6 +10,7 @@ enum WriterStyle {
 class QuietButton: NSButton {
     private var tracking: NSTrackingArea?
     var hovered = false
+    var highlightsOnHover = true
     override init(frame: NSRect) { super.init(frame: frame); isBordered = false; focusRingType = .none; contentTintColor = WriterStyle.muted }
     required init?(coder: NSCoder) { fatalError() }
     override var mouseDownCanMoveWindow: Bool { false }
@@ -25,7 +26,7 @@ class QuietButton: NSButton {
     override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
     override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
     override func draw(_ dirtyRect: NSRect) {
-        if isEnabled && (hovered || isHighlighted) {
+        if isEnabled && ((highlightsOnHover && hovered) || isHighlighted) {
             WriterStyle.hover.setFill(); NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
         }
         super.draw(dirtyRect)

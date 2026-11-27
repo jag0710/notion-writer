@@ -126,9 +126,25 @@ func verifyVideoAndPropertyRecall(root: URL) async throws {
     try require(reopened.draft.tags["reference"] == ["web"] &&
                 reopened.draft.urls["url"] == "https://example.com/10", "Click did not restore the second property set")
     writer.focusProperty(0)
+    try verifyCandidateHover(row)
     _ = row.control(row.search, textView: editor, doCommandBy: #selector(NSResponder.insertTab(_:)))
     try require(writer.tagRows.first?.optionsPanel.isVisible == true && !row.optionsPanel.isVisible,
                 "Tab moved to the wrong property after recent items")
+    guard let tagIndex = writer.tagRows.firstIndex(where: { $0.table.numberOfRows > 1 }) else {
+        throw CheckFailure.failed("Test schema is missing a multi-option tag picker")
+    }
+    writer.focusProperty(tagIndex + 1)
+    let tags = writer.tagRows[tagIndex]
+    try verifyCandidateHover(tags)
+    tags.search.stringValue = "一致しない検索語 🎷"
+    tags.filter()
+    tags.table.layoutSubtreeIfNeeded()
+    guard let emptyRow = tags.table.rowView(atRow: 0, makeIfNecessary: true) as? CandidateRow else {
+        throw CheckFailure.failed("Search result placeholder row missing")
+    }
+    emptyRow.updateTrackingAreas()
+    try require(!emptyRow.trackingAreas.contains(where: { $0.owner === emptyRow }) && !emptyRow.isHovered &&
+                tags.table.selectedRow == -1, "The empty-results message acted like a selectable row")
     for direction in [#selector(NSResponder.moveLeft(_:)), #selector(NSResponder.moveRight(_:))] {
         writer.focusProperty(0)
         _ = row.control(row.search, textView: editor, doCommandBy: direction)
@@ -136,5 +152,38 @@ func verifyVideoAndPropertyRecall(root: URL) async throws {
                     "Horizontal arrows did not return title focus")
     }
     writer.window?.orderOut(nil)
-    print("PASS: YouTube fields and failure safety, standalone recent items, selected text contrast and Enter/click recall")
+    print("PASS: YouTube fields and failure safety, standalone recent items, hover, selected text contrast and Enter/click recall")
+}
+
+
+@MainActor
+private func verifyCandidateHover(_ picker: TagRow) throws {
+    picker.optionsPanel.contentView?.layoutSubtreeIfNeeded()
+    let selectedRow = picker.table.selectedRow
+    let chosenTags = picker.selection
+    guard picker.table.numberOfRows > 1,
+          let candidate = picker.table.rowView(atRow: 1, makeIfNecessary: true) as? CandidateRow,
+          let window = candidate.window else { throw CheckFailure.failed("Second candidate row missing") }
+    candidate.updateTrackingAreas()
+    guard let tracking = candidate.trackingAreas.first(where: { $0.owner === candidate }),
+          tracking.options.contains(.inVisibleRect) else {
+        throw CheckFailure.failed("Candidate did not track the visible row")
+    }
+    let point = candidate.convert(NSPoint(x: candidate.bounds.midX, y: candidate.bounds.midY), to: nil)
+    func pointerEvent(_ type: NSEvent.EventType) throws -> NSEvent {
+        guard let event = NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [],
+                                                timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                eventNumber: 0, trackingNumber: 0, userData: nil) else {
+            throw CheckFailure.failed("Could not construct candidate pointer event")
+        }
+        return event
+    }
+
+    candidate.mouseExited(with: try pointerEvent(.mouseExited))
+    try require(!candidate.isHovered, "Candidate stayed highlighted after the cursor left")
+    candidate.mouseEntered(with: try pointerEvent(.mouseEntered))
+    try require(candidate.isHovered && picker.table.selectedRow == selectedRow && picker.selection == chosenTags,
+                "Hover did not highlight the candidate independently of keyboard focus and chosen tags")
+    candidate.mouseExited(with: try pointerEvent(.mouseExited))
+    try require(!candidate.isHovered, "Candidate stayed highlighted after the cursor left again")
 }

@@ -11,6 +11,22 @@ class WriterTextView: NSTextView {
     var save: (() -> Void)?
     var dismiss: (() -> Void)?
     var compositionChanged: (() -> Void)?
+    let editHistory = UndoManager()
+
+    func resetEditHistory() {
+        breakUndoCoalescing()
+        editHistory.removeAllActions()
+    }
+
+    func changeEditHistory(redo: Bool) {
+        guard isEditable, !hasMarkedText() else { return }
+        breakUndoCoalescing()
+        if redo {
+            if editHistory.canRedo { editHistory.redo() }
+        } else if editHistory.canUndo {
+            editHistory.undo()
+        }
+    }
 
     override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
@@ -59,8 +75,17 @@ final class WriterPanel: NSPanel {
         return true
     }
 
+    private func performHistoryShortcut(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(Shortcut.commandModifiers)
+        guard attachedSheet == nil, let editor = firstResponder as? WriterTextView,
+              modifiers == .command || modifiers == [.command, .shift],
+              event.charactersIgnoringModifiers?.lowercased() == "z" else { return false }
+        editor.changeEditHistory(redo: modifiers.contains(.shift))
+        return true
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if performClearShortcut(event, responder: firstResponder) { return true }
+        if performClearShortcut(event, responder: firstResponder) || performHistoryShortcut(event) { return true }
         if Shortcut.send.matches(event) {
             if (firstResponder as? NSTextView)?.hasMarkedText() != true { save?() }
             return true
@@ -69,7 +94,7 @@ final class WriterPanel: NSPanel {
     }
 
     override func sendEvent(_ event: NSEvent) {
-        if event.type == .keyDown, performClearShortcut(event, responder: firstResponder) { return }
+        if event.type == .keyDown, performClearShortcut(event, responder: firstResponder) || performHistoryShortcut(event) { return }
         super.sendEvent(event)
     }
 }
@@ -202,7 +227,6 @@ final class WriterPanel: NSPanel {
         bodyEditor.importWebContent = { [weak self] source, range in self?.importWebContent(source, replacing: range) }
         bodyEditor.placeholder = "本文を入力…"
         bodyEditor.setAccessibilityLabel("本文")
-        bodyEditor.allowsUndo = true
         bodyEditor.importsGraphics = false
         bodyEditor.tab = { [weak self] back in
             guard let self else { return }
@@ -307,6 +331,7 @@ final class WriterPanel: NSPanel {
         UserDefaults.standard.set(NSStringFromPoint(window.frame.origin), forKey: "writerFreeOrigin")
     }
     func configureEditor(_ editor: WriterTextView) {
+        editor.allowsUndo = true
         editor.isRichText = false; editor.isAutomaticQuoteSubstitutionEnabled = false; editor.isAutomaticDashSubstitutionEnabled = false
         editor.isAutomaticTextReplacementEnabled = false; editor.isAutomaticSpellingCorrectionEnabled = false
         editor.backgroundColor = .white; editor.textColor = NSColor(white: 0.18, alpha: 1); editor.insertionPointColor = .labelColor; editor.font = .systemFont(ofSize: 16); editor.textContainerInset = NSSize(width: 0, height: 3); editor.textContainer?.lineFragmentPadding = 0
@@ -346,6 +371,10 @@ final class WriterPanel: NSPanel {
         previousApp?.activate(options: [])
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool { hide(); return false }
+    func undoManager(for view: NSTextView) -> UndoManager? {
+        (view as? WriterTextView)?.editHistory
+    }
+
     func textDidChange(_ notification: Notification) {
         guard !resettingDraft else { return }
         if (notification.object as? NSTextView) === titleEditor {
@@ -423,8 +452,8 @@ final class WriterPanel: NSPanel {
             titleEditor.unmarkText()
             bodyEditor.unmarkText()
             window?.undoManager?.removeAllActions()
-            titleEditor.undoManager?.removeAllActions()
-            bodyEditor.undoManager?.removeAllActions()
+            titleEditor.resetEditHistory()
+            bodyEditor.resetEditHistory()
             loadedBody = nil
             bodyLoadError = nil
             resettingDraft = false
@@ -474,7 +503,10 @@ final class WriterPanel: NSPanel {
             if needsPosition && state.display.fixedPosition && window?.isVisible == true { positionAtFixedLocation() }
         }
         setEnabled(properties, enabled: titleEditor.isEditable)
-        if titleEditor.string != state.draft.title && !titleEditor.hasMarkedText() { titleEditor.string = state.draft.title }
+        if titleEditor.string != state.draft.title && !titleEditor.hasMarkedText() {
+            titleEditor.resetEditHistory()
+            titleEditor.string = state.draft.title
+        }
         updateBodyPresentation()
         fitContent()
     }
@@ -659,7 +691,6 @@ final class WriterPanel: NSPanel {
         if let title, !titleEditor.hasMarkedText(),
            state.draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             state.draft.title = title
-            titleEditor.string = title
         }
         if let property = state.sourceURLProperty,
            (state.draft.urls[property.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
